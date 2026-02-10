@@ -32,9 +32,41 @@ install_deps() {
     echo -e "${YELLOW}[G-Tun] Installing System Dependencies...${NC}"
     apt update -q && apt install -y -q git curl wget tar lsof psmisc nano screen net-tools vnstat
 
+    # Check if Go is installed
     if [ ! -f "$GO_BIN" ]; then
-        echo -e "${YELLOW}[G-Tun] Installing Go 1.23.1...${NC}"
-        wget -q https://go.dev/dl/go1.23.1.linux-amd64.tar.gz
+        echo -e "${YELLOW}[G-Tun] Go not found. Installing Go 1.23.1...${NC}"
+        
+        # Clean previous attempts
+        rm -f go1.23.1.linux-amd64.tar.gz
+
+        # ---------------------------------------------------------
+        # METHOD 1: Official Server
+        # ---------------------------------------------------------
+        echo -e "Attempt 1: Downloading from Official Server..."
+        if wget -q --show-progress --progress=bar:force https://go.dev/dl/go1.23.1.linux-amd64.tar.gz; then
+            echo -e "${GREEN}Download successful from Official Server.${NC}"
+        
+        # ---------------------------------------------------------
+        # METHOD 2: GitHub Repository (Fallback)
+        # ---------------------------------------------------------
+        else
+            echo -e "${RED}Official server failed.${NC}"
+            echo -e "${YELLOW}Attempt 2: Downloading from YOUR GitHub Repository...${NC}"
+            
+            # Construct Raw URL
+            REPO_FILE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$REPO_NAME/$BRANCH/go1.23.1.linux-amd64.tar.gz"
+            
+            if wget -q --show-progress --progress=bar:force "$REPO_FILE_URL"; then
+                echo -e "${GREEN}Download successful from GitHub Repo.${NC}"
+            else
+                echo -e "${RED}Critical Error: Failed to download Go from GitHub too!${NC}"
+                echo -e "Check if file 'go1.23.1.linux-amd64.tar.gz' exists in your repo root."
+                exit 1
+            fi
+        fi
+
+        # Extracting
+        echo -e "${YELLOW}Extracting Go...${NC}"
         rm -rf /usr/local/go && tar -C /usr/local -xzf go1.23.1.linux-amd64.tar.gz
         rm go1.23.1.linux-amd64.tar.gz
         export PATH=$PATH:/usr/local/go/bin
@@ -47,12 +79,16 @@ install_deps() {
     fi
 
     echo -e "${YELLOW}[G-Tun] Fixing Go Modules...${NC}"
+    export PATH=$PATH:/usr/local/go/bin
+    
     for dir in "$INSTALL_DIR/server" "$INSTALL_DIR/client"; do
         cd "$dir"
-        "$GO_BIN" mod tidy 2>/dev/null
-        "$GO_BIN" get github.com/gorilla/websocket
-        "$GO_BIN" get github.com/xtaci/kcp-go/v5
-        "$GO_BIN" get github.com/xtaci/smux
+        if [ -f "go.mod" ]; then
+            "$GO_BIN" mod tidy 2>/dev/null
+            "$GO_BIN" get github.com/gorilla/websocket
+            "$GO_BIN" get github.com/xtaci/kcp-go/v5
+            "$GO_BIN" get github.com/xtaci/smux
+        fi
     done
 
     echo -e "${YELLOW}[G-Tun] Building Binaries...${NC}"
