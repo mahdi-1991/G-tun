@@ -54,7 +54,7 @@ install_deps() {
             echo -e "${YELLOW}Attempt 2: Downloading from YOUR GitHub Repository...${NC}"
             
             # Construct Raw URL
-            REPO_FILE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$REPO_NAME/$BRANCH/go1.23.1.linux-amd64.tar.gz"
+            REPO_FILE_URL="https://raw.githubusercontent.com/mahdi-1991/G-tun/refs/heads/main/go1.23.1.linux-amd64.tar.gz"
             
             if wget -q --show-progress --progress=bar:force "$REPO_FILE_URL"; then
                 echo -e "${GREEN}Download successful from GitHub Repo.${NC}"
