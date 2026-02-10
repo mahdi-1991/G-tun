@@ -40,7 +40,7 @@
 </p>
 
 Run the following command on your **VPS**. 
-This script works for both the **Foreign Server** and the **Iran Client**.
+This script works for both the **Foreign Server** and the **Client**.
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/mahdi-1991/G-tun/main/install.sh)
