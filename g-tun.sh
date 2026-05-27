@@ -1,4 +1,3 @@
-cat << 'EOF' > /usr/bin/g-tun
 #!/bin/bash
 # G-Tun Full Control Panel
 
@@ -119,7 +118,3 @@ show_menu() {
 }
 
 show_menu
-EOF
-
-chmod +x /usr/bin/g-tun
-echo "Control menu updated with Update and Uninstall options! Type 'g-tun' to open it."
