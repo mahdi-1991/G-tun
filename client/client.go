@@ -1,178 +1,336 @@
-// Package main implements the G-Tun client.
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/smux"
 )
 
-// Config holds the client configuration parameters.
-type Config struct {
-	ServerIP    string `json:"server_ip"`
-	ControlPort string `json:"control_port"`
-	DataPort    string `json:"data_port"`
-	LocalPort   string `json:"local_port"`
-	Token       string `json:"token"`
+type KcpConfig struct {
+	NoDelay      int
+	Interval     int
+	Resend       int
+	NoCongestion int
+	SndWnd       int
+	RcvWnd       int
+	DataShards   int
+	ParityShards int
+}
+
+type ClientConfig struct {
+	ControlServerAddress string    `json:"control_server_address"`
+	LocalListenPort      string    `json:"local_listen_port"`
+	RemoteServerIP       string    `json:"remote_server_ip"`
+	DataPort             string    `json:"data_port"`
+	Token                string    `json:"token"`
+	KcpConfig            KcpConfig `json:"kcp_config"`
+}
+
+var config ClientConfig
+var bufferPool = sync.Pool{
+	New: func() interface{} { b := make([]byte, 64*1024); return &b },
+}
+
+type Message struct {
+	Command string `json:"command"`
+	Payload string `json:"payload"`
+}
+
+type TransportConfig struct {
+	Protocol string `json:"protocol"`
+	Port     string `json:"port"`
+}
+
+type wsConnWrapper struct {
+	*websocket.Conn
+	r io.Reader
+}
+
+func (c *wsConnWrapper) Read(b []byte) (int, error) {
+	if c.r == nil {
+		_, r, err := c.NextReader()
+		if err != nil { return 0, err }
+		c.r = r
+	}
+	n, err := c.r.Read(b)
+	if err == io.EOF { c.r = nil; err = nil }
+	return n, err
+}
+
+func (c *wsConnWrapper) Write(b []byte) (int, error) {
+	err := c.WriteMessage(websocket.BinaryMessage, b)
+	if err != nil { return 0, err }
+	return len(b), nil
+}
+
+func logInfo(message string) {
+	fmt.Printf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), message)
+}
+
+func loadClientConfiguration() {
+	file, err := os.Open("client_config.json")
+	if err != nil { os.Exit(1) }
+	defer file.Close()
+	json.NewDecoder(file).Decode(&config)
+}
+
+func relayConnections(dst io.Writer, src io.Reader) {
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+	io.CopyBuffer(dst, src, *bufPtr)
+}
+
+func startTcpDataForwarder(ctx context.Context, dataPort string) {
+	listener, _ := net.Listen("tcp", config.LocalListenPort)
+	go func() { <-ctx.Done(); listener.Close() }()
+	remoteDataAddr := config.RemoteServerIP + ":" + dataPort
+	for {
+		localConn, err := listener.Accept()
+		if err != nil { return }
+		go func(lconn net.Conn) {
+			defer lconn.Close()
+			rconn, err := net.Dial("tcp", remoteDataAddr)
+			if err != nil { return }
+			defer rconn.Close()
+			go relayConnections(rconn, lconn)
+			relayConnections(lconn, rconn)
+		}(localConn)
+	}
+}
+
+func startUdpDataForwarder(ctx context.Context, dataPort string) {
+	localAddr, _ := net.ResolveUDPAddr("udp", config.LocalListenPort)
+	localConn, _ := net.ListenUDP("udp", localAddr)
+	go func() { <-ctx.Done(); localConn.Close() }()
+	remoteDataAddr := config.RemoteServerIP + ":" + dataPort
+	sessions := make(map[string]*net.UDPConn)
+	var mu sync.Mutex
+	buf := make([]byte, 4096)
+	for {
+		n, clientAddr, err := localConn.ReadFromUDP(buf)
+		if err != nil { return }
+		mu.Lock()
+		remoteConn, ok := sessions[clientAddr.String()]
+		if !ok {
+			udpServerAddr, _ := net.ResolveUDPAddr("udp", remoteDataAddr)
+			remoteConn, _ = net.DialUDP("udp", nil, udpServerAddr)
+			sessions[clientAddr.String()] = remoteConn
+			go func(lconn *net.UDPConn, rconn *net.UDPConn, cAddr *net.UDPAddr) {
+				remoteBufPtr := bufferPool.Get().(*[]byte)
+				defer bufferPool.Put(remoteBufPtr)
+				for {
+					m, err := rconn.Read(*remoteBufPtr)
+					if err != nil {
+						mu.Lock()
+						delete(sessions, cAddr.String())
+						mu.Unlock()
+						rconn.Close()
+						return
+					}
+					lconn.WriteToUDP((*remoteBufPtr)[:m], cAddr)
+				}
+			}(localConn, remoteConn, clientAddr)
+		}
+		mu.Unlock()
+		remoteConn.Write(buf[:n])
+	}
+}
+
+func relayWs(localConn net.Conn, wsConn *websocket.Conn) {
+	errChan := make(chan error, 2)
+	go func() {
+		bufPtr := bufferPool.Get().(*[]byte)
+		defer bufferPool.Put(bufPtr)
+		buf := *bufPtr
+		for {
+			n, err := localConn.Read(buf)
+			if err != nil { errChan <- err; return }
+			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil { errChan <- err; return }
+		}
+	}()
+	go func() {
+		for {
+			mt, message, err := wsConn.ReadMessage()
+			if err != nil { errChan <- err; return }
+			if mt == websocket.BinaryMessage {
+				if _, err := localConn.Write(message); err != nil { errChan <- err; return }
+			}
+		}
+	}()
+	<-errChan
+}
+
+func startWsDataForwarder(ctx context.Context, dataPort string) {
+	listener, _ := net.Listen("tcp", config.LocalListenPort)
+	go func() { <-ctx.Done(); listener.Close() }()
+	u := url.URL{Scheme: "ws", Host: config.RemoteServerIP + ":" + dataPort, Path: "/ws"}
+	for {
+		localConn, err := listener.Accept()
+		if err != nil { return }
+		go func(lconn net.Conn) {
+			defer lconn.Close()
+			wsConn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+			if err != nil { return }
+			defer wsConn.Close()
+			relayWs(lconn, wsConn)
+		}(localConn)
+	}
+}
+
+func handleLocalMuxConnection(lconn net.Conn, session *smux.Session) {
+	defer lconn.Close()
+	stream, err := session.OpenStream()
+	if err != nil { return }
+	defer stream.Close()
+	go relayConnections(stream, lconn)
+	relayConnections(lconn, stream)
+}
+
+func startTcpMuxDataForwarder(ctx context.Context, dataPort string) {
+	baseConn, err := net.Dial("tcp", config.RemoteServerIP+":"+dataPort)
+	if err != nil { return }
+	session, err := smux.Client(baseConn, nil)
+	if err != nil { return }
+	listener, err := net.Listen("tcp", config.LocalListenPort)
+	if err != nil { return }
+	go func() { <-ctx.Done(); listener.Close(); session.Close() }()
+	for {
+		localConn, err := listener.Accept()
+		if err != nil { return }
+		go handleLocalMuxConnection(localConn, session)
+	}
+}
+
+func startWsMuxDataForwarder(ctx context.Context, dataPort string) {
+	u := url.URL{Scheme: "ws", Host: config.RemoteServerIP + ":" + dataPort, Path: "/wsmux"}
+	ws, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil { return }
+	session, err := smux.Client(&wsConnWrapper{Conn: ws}, nil)
+	if err != nil { return }
+	listener, err := net.Listen("tcp", config.LocalListenPort)
+	if err != nil { return }
+	go func() { <-ctx.Done(); listener.Close(); session.Close() }()
+	for {
+		localConn, err := listener.Accept()
+		if err != nil { return }
+		go handleLocalMuxConnection(localConn, session)
+	}
+}
+
+func startWssDataForwarder(ctx context.Context, dataPort string) {
+	listener, _ := net.Listen("tcp", config.LocalListenPort)
+	go func() { <-ctx.Done(); listener.Close() }()
+	u := url.URL{Scheme: "wss", Host: config.RemoteServerIP + ":" + dataPort, Path: "/wss"}
+	dialer := websocket.DefaultDialer
+	dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	for {
+		localConn, err := listener.Accept()
+		if err != nil { return }
+		go func(lconn net.Conn) {
+			defer lconn.Close()
+			wsConn, _, err := dialer.Dial(u.String(), nil)
+			if err != nil { return }
+			defer wsConn.Close()
+			relayWs(lconn, wsConn)
+		}(localConn)
+	}
+}
+
+func startWssMuxDataForwarder(ctx context.Context, dataPort string) {
+	u := url.URL{Scheme: "wss", Host: config.RemoteServerIP + ":" + dataPort, Path: "/wssmux"}
+	dialer := websocket.DefaultDialer
+	dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	ws, _, err := dialer.Dial(u.String(), nil)
+	if err != nil { return }
+	session, err := smux.Client(&wsConnWrapper{Conn: ws}, nil)
+	if err != nil { return }
+	listener, err := net.Listen("tcp", config.LocalListenPort)
+	if err != nil { return }
+	go func() { <-ctx.Done(); listener.Close(); session.Close() }()
+	for {
+		localConn, err := listener.Accept()
+		if err != nil { return }
+		go handleLocalMuxConnection(localConn, session)
+	}
+}
+
+func startUtcpMuxDataForwarder(ctx context.Context, dataPort string) {
+	kcpConf := config.KcpConfig
+	baseConn, err := kcp.DialWithOptions(config.RemoteServerIP+":"+dataPort, nil, kcpConf.DataShards, kcpConf.ParityShards)
+	if err != nil { return }
+	baseConn.SetNoDelay(kcpConf.NoDelay, kcpConf.Interval, kcpConf.Resend, kcpConf.NoCongestion)
+	baseConn.SetWindowSize(kcpConf.SndWnd, kcpConf.RcvWnd)
+	session, err := smux.Client(baseConn, nil)
+	if err != nil { return }
+	listener, err := net.Listen("tcp", config.LocalListenPort)
+	if err != nil { return }
+	go func() { <-ctx.Done(); listener.Close(); session.Close() }()
+	for {
+		localConn, err := listener.Accept()
+		if err != nil { return }
+		go handleLocalMuxConnection(localConn, session)
+	}
 }
 
 func main() {
-	configPath := flag.String("config", "client_config.json", "Path to config file")
-	flag.Parse()
-
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
-	}
-
-	// Start the robust control loop
-	startControlLoop(cfg)
-}
-
-func loadConfig(path string) (Config, error) {
-	var cfg Config
-	file, err := os.Open(path)
-	if err != nil {
-		return cfg, err
-	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	err = decoder.Decode(&cfg)
-	return cfg, err
-}
-
-func startControlLoop(cfg Config) {
+	loadClientConfiguration()
 	var currentCancel context.CancelFunc
 
 	for {
-		targetAddr := fmt.Sprintf("%s:%s", cfg.ServerIP, cfg.ControlPort)
-		log.Printf("Attempting to connect to control server at %s...", targetAddr)
-
-		conn, err := net.Dial("tcp", targetAddr)
+		logInfo("Connecting to control server...")
+		conn, err := net.Dial("tcp", config.ControlServerAddress)
 		if err != nil {
-			log.Printf("Connection failed, retrying in 5 seconds... (%v)", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		// 1. Send Authentication Token
-		_, err = conn.Write([]byte(cfg.Token + "\n"))
-		if err != nil {
-			log.Printf("Failed to send token: %v", err)
-			conn.Close()
 			time.Sleep(3 * time.Second)
 			continue
 		}
 
-		// 2. Read Server Commands
+		conn.Write([]byte(config.Token + "\n"))
 		reader := bufio.NewReader(conn)
-		for {
-			msg, err := reader.ReadString('\n')
-			if err != nil {
-				log.Printf("Control connection lost: %v", err)
-				break // Break inner loop to trigger reconnect
-			}
+		
+		msgStr, err := reader.ReadString('\n')
+		if err != nil { conn.Close(); continue }
+		
+		var msg Message
+		if err := json.Unmarshal([]byte(msgStr), &msg); err != nil {
+			conn.Close(); continue
+		}
 
-			msg = strings.TrimSpace(msg)
-			if strings.HasPrefix(msg, "start_transport") {
-				parts := strings.Split(msg, " ")
-				if len(parts) >= 2 {
-					protocol := parts[1]
-					log.Printf("Received start command for protocol: %s", protocol)
+		if msg.Command == "start_transport" {
+			if currentCancel != nil { currentCancel() }
+			ctx, cancel := context.WithCancel(context.Background())
+			currentCancel = cancel
 
-					// Cancel the previous listener if it exists
-					if currentCancel != nil {
-						currentCancel()
-					}
+			var configData TransportConfig
+			json.Unmarshal([]byte(msg.Payload), &configData)
+			
+			logInfo("Starting protocol: " + configData.Protocol)
 
-					// Create a new context for the new local listener
-					ctx, cancel := context.WithCancel(context.Background())
-					currentCancel = cancel
-
-					// Start local listener in a new goroutine
-					go startLocalListener(ctx, cfg)
-				}
+			switch configData.Protocol {
+			case "tcp": go startTcpDataForwarder(ctx, configData.Port)
+			case "udp": go startUdpDataForwarder(ctx, configData.Port)
+			case "ws": go startWsDataForwarder(ctx, configData.Port)
+			case "tcpmux": go startTcpMuxDataForwarder(ctx, configData.Port)
+			case "wsmux": go startWsMuxDataForwarder(ctx, configData.Port)
+			case "wss": go startWssDataForwarder(ctx, configData.Port)
+			case "wssmux": go startWssMuxDataForwarder(ctx, configData.Port)
+			case "utcpmux": go startUtcpMuxDataForwarder(ctx, configData.Port)
 			}
 		}
 
-		// Clean up before retrying
+		reader.ReadString('\n') // Block until server disconnects
 		conn.Close()
-		if currentCancel != nil {
-			currentCancel()
-		}
-		time.Sleep(3 * time.Second)
 	}
-}
-
-func startLocalListener(ctx context.Context, cfg Config) {
-	addr := ":" + cfg.LocalPort
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Printf("Failed to start local listener on %s: %v", addr, err)
-		return
-	}
-	log.Printf("Local listener started on %s. Ready to proxy traffic.", addr)
-
-	// Goroutine to cleanly shutdown the listener when context is canceled
-	go func() {
-		<-ctx.Done()
-		log.Printf("Shutting down local listener on %s", addr)
-		listener.Close()
-	}()
-
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			// If context is canceled, exit the loop gracefully
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("Failed to accept local connection: %v", err)
-			continue
-		}
-
-		go handleProxyConnection(clientConn, cfg)
-	}
-}
-
-func handleProxyConnection(localConn net.Conn, cfg Config) {
-	serverAddr := fmt.Sprintf("%s:%s", cfg.ServerIP, cfg.DataPort)
-	serverConn, err := net.Dial("tcp", serverAddr)
-	if err != nil {
-		log.Printf("Failed to connect to remote data server at %s: %v", serverAddr, err)
-		localConn.Close()
-		return
-	}
-
-	// Relay data bidirectionally
-	relay(localConn, serverConn)
-}
-
-// relay bidirectionally copies data between two connections safely.
-func relay(left, right net.Conn) {
-	defer left.Close()
-	defer right.Close()
-
-	errc := make(chan error, 2)
-
-	go func() {
-		_, err := io.Copy(right, left)
-		errc <- err
-	}()
-
-	go func() {
-		_, err := io.Copy(left, right)
-		errc <- err
-	}()
-
-	<-errc
 }
