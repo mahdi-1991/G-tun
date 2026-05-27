@@ -1,4 +1,3 @@
-cat << 'EOF' > /root/G-tun-Project/install.sh
 #!/bin/bash
 # G-Tun Setup and Installation Script
 set -e
@@ -13,9 +12,9 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "Checking dependencies..."
-apt-get update -y && apt-get install -y git curl wget tar systemd
+apt-get update -y && apt-get install -y git curl wget tar systemd openssl
 
-# 1. Install Go 1.23.0 safely and bypass apt versions
+# 1. Install Go 1.23.0 safely
 if [ ! -f "/usr/local/go/bin/go" ] || ! /usr/local/go/bin/go version | grep -q "go1.23"; then
     echo "Installing Go 1.23.0..."
     wget -q https://go.dev/dl/go1.23.0.linux-amd64.tar.gz -O /tmp/go1.23.0.tar.gz
@@ -74,7 +73,7 @@ if [ "$SETUP_TYPE" == "1" ]; then
     fi
 
     mkdir -p /etc/g-tun
-    cat <<INNER_EOF > /etc/g-tun/server_config.json
+    cat <<EOF > /etc/g-tun/server_config.json
 {
     "control_port": "$CONTROL_PORT",
     "data_port": "$DATA_PORT",
@@ -88,17 +87,16 @@ if [ "$SETUP_TYPE" == "1" ]; then
         "SndWnd": 1024, "RcvWnd": 1024, "DataShards": 10, "ParityShards": 3
     }
 }
-INNER_EOF
+EOF
 
     echo "Building Server Binary..."
     cd server
     
-    # 2. Using absolute path to guarantee Go 1.23 is used
     /usr/local/go/bin/go mod tidy
     /usr/local/go/bin/go build -o g-tun-server server.go
     mv g-tun-server /usr/local/bin/
 
-    cat <<INNER_EOF > /etc/systemd/system/g-tun-server.service
+    cat <<EOF > /etc/systemd/system/g-tun-server.service
 [Unit]
 Description=G-Tun Server Service
 After=network.target
@@ -114,7 +112,7 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-INNER_EOF
+EOF
 
     systemctl daemon-reload
     systemctl enable g-tun-server
@@ -154,7 +152,7 @@ elif [ "$SETUP_TYPE" == "2" ]; then
     fi
 
     mkdir -p /etc/g-tun
-    cat <<INNER_EOF > /etc/g-tun/client_config.json
+    cat <<EOF > /etc/g-tun/client_config.json
 {
     "control_server_address": "$SERVER_IP:$CONTROL_PORT",
     "remote_server_ip": "$SERVER_IP",
@@ -166,17 +164,16 @@ elif [ "$SETUP_TYPE" == "2" ]; then
         "SndWnd": 1024, "RcvWnd": 1024, "DataShards": 10, "ParityShards": 3
     }
 }
-INNER_EOF
+EOF
 
     echo "Building Client Binary..."
     cd client
     
-    # 2. Using absolute path to guarantee Go 1.23 is used
     /usr/local/go/bin/go mod tidy
     /usr/local/go/bin/go build -o g-tun-client client.go
     mv g-tun-client /usr/local/bin/
 
-    cat <<INNER_EOF > /etc/systemd/system/g-tun-client.service
+    cat <<EOF > /etc/systemd/system/g-tun-client.service
 [Unit]
 Description=G-Tun Client Service
 After=network.target
@@ -192,7 +189,7 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-INNER_EOF
+EOF
 
     systemctl daemon-reload
     systemctl enable g-tun-client
@@ -202,7 +199,3 @@ INNER_EOF
     echo " Client setup complete and running in background!"
     echo "=========================================================================="
 fi
-EOF
-
-cd /root/G-tun-Project
-bash install.sh
