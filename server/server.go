@@ -91,14 +91,19 @@ func relayConnections(dst io.Writer, src io.Reader) {
 func handleTcpDataConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 	xrayConn, err := net.Dial("tcp", config.XrayInboundAddress)
-	if err != nil { return }
+	if err != nil { 
+		logInfo("Failed to dial Xray: " + err.Error())
+		return 
+	}
 	defer xrayConn.Close()
 	go relayConnections(xrayConn, clientConn)
 	relayConnections(clientConn, xrayConn)
 }
 
 func startTcpDataListener() {
-	listener, _ := net.Listen("tcp", "0.0.0.0:"+config.DataPort)
+	listener, err := net.Listen("tcp", "0.0.0.0:"+config.DataPort)
+	if err != nil { logInfo("TCP Listen Error: " + err.Error()); return }
+	logInfo("TCP Listener started on port " + config.DataPort)
 	for {
 		conn, err := listener.Accept()
 		if err == nil { go handleTcpDataConnection(conn) }
@@ -107,7 +112,9 @@ func startTcpDataListener() {
 
 func startUdpDataListener() {
 	udpAddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:"+config.DataPort)
-	conn, _ := net.ListenUDP("udp", udpAddr)
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil { logInfo("UDP Listen Error: " + err.Error()); return }
+	logInfo("UDP Listener started on port " + config.DataPort)
 	sessions := make(map[string]net.Conn)
 	var mapMutex sync.Mutex
 	buf := make([]byte, 4096)
@@ -118,7 +125,10 @@ func startUdpDataListener() {
 		xrayConn, ok := sessions[remoteAddr.String()]
 		if !ok {
 			xrayConn, err = net.Dial("tcp", config.XrayInboundAddress)
-			if err != nil { mapMutex.Unlock(); continue }
+			if err != nil { 
+				logInfo("Failed to dial Xray: " + err.Error())
+				mapMutex.Unlock(); continue 
+			}
 			sessions[remoteAddr.String()] = xrayConn
 			go func(udpConn *net.UDPConn, clientAddr *net.UDPAddr, tcpConn net.Conn) {
 				tcpBufPtr := bufferPool.Get().(*[]byte)
@@ -154,7 +164,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 func handleWsDataConnection(wsConn *websocket.Conn) {
 	defer wsConn.Close()
 	xrayConn, err := net.Dial("tcp", config.XrayInboundAddress)
-	if err != nil { return }
+	if err != nil { 
+		logInfo("Failed to dial Xray: " + err.Error())
+		return 
+	}
 	defer xrayConn.Close()
 	errChan := make(chan error, 2)
 	go func() {
@@ -183,26 +196,32 @@ func startWsDataListener() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler)
 	server := &http.Server{Addr: "0.0.0.0:" + config.DataPort, Handler: mux}
+	logInfo("WS Listener started on port " + config.DataPort)
 	server.ListenAndServe()
 }
 
 func handleMuxStream(stream io.ReadWriteCloser) {
 	defer stream.Close()
 	xrayConn, err := net.Dial("tcp", config.XrayInboundAddress)
-	if err != nil { return }
+	if err != nil { 
+		logInfo("Failed to dial Xray: " + err.Error())
+		return 
+	}
 	defer xrayConn.Close()
 	go relayConnections(xrayConn, stream)
 	relayConnections(stream, xrayConn)
 }
 
 func startTcpMuxDataListener() {
-	listener, _ := net.Listen("tcp", "0.0.0.0:"+config.DataPort)
+	listener, err := net.Listen("tcp", "0.0.0.0:"+config.DataPort)
+	if err != nil { logInfo("TCPMux Listen Error: " + err.Error()); return }
+	logInfo("TCPMux Listener started on port " + config.DataPort)
 	for {
 		conn, err := listener.Accept()
 		if err == nil {
 			go func(c net.Conn) {
 				session, err := smux.Server(c, nil)
-				if err != nil { return }
+				if err != nil { logInfo("Smux Error: " + err.Error()); return }
 				for {
 					stream, err := session.AcceptStream()
 					if err != nil { break }
@@ -229,6 +248,7 @@ func startWsMuxDataListener() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/wsmux", wsmuxHandler)
 	server := &http.Server{Addr: "0.0.0.0:" + config.DataPort, Handler: mux}
+	logInfo("WSMux Listener started on port " + config.DataPort)
 	server.ListenAndServe()
 }
 
@@ -236,6 +256,7 @@ func startWssDataListener() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/wss", wsHandler)
 	server := &http.Server{Addr: "0.0.0.0:" + config.DataPort, Handler: mux}
+	logInfo("WSS Listener started on port " + config.DataPort)
 	server.ListenAndServeTLS(config.TlsCertPath, config.TlsKeyPath)
 }
 
@@ -255,13 +276,15 @@ func startWssMuxDataListener() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/wssmux", wssmuxHandler)
 	server := &http.Server{Addr: "0.0.0.0:" + config.DataPort, Handler: mux}
+	logInfo("WSSMux Listener started on port " + config.DataPort)
 	server.ListenAndServeTLS(config.TlsCertPath, config.TlsKeyPath)
 }
 
 func startUtcpMuxDataListener() {
 	kcpConf := config.KcpConfig
 	listener, err := kcp.ListenWithOptions("0.0.0.0:"+config.DataPort, nil, kcpConf.DataShards, kcpConf.ParityShards)
-	if err != nil { return }
+	if err != nil { logInfo("KCP Listen Error: " + err.Error()); return }
+	logInfo("UTCPMux (KCP) Listener started on port " + config.DataPort)
 	for {
 		conn, err := listener.AcceptKCP()
 		if err == nil {
@@ -269,7 +292,7 @@ func startUtcpMuxDataListener() {
 			conn.SetWindowSize(kcpConf.SndWnd, kcpConf.RcvWnd)
 			go func(c net.Conn) {
 				session, err := smux.Server(c, nil)
-				if err != nil { return }
+				if err != nil { logInfo("Smux Server Error: " + err.Error()); return }
 				for {
 					stream, err := session.AcceptStream()
 					if err != nil { break }
@@ -282,7 +305,7 @@ func startUtcpMuxDataListener() {
 
 func main() {
 	loadServerConfiguration()
-	logInfo("Server starting on port " + config.ControlPort)
+	logInfo("Server starting control listener on port " + config.ControlPort)
 
 	// Start data listener once based on config
 	switch config.Protocol {
@@ -297,7 +320,7 @@ func main() {
 	}
 
 	listener, err := net.Listen("tcp", "0.0.0.0:"+config.ControlPort)
-	if err != nil { os.Exit(1) }
+	if err != nil { logInfo("Failed to start control port: " + err.Error()); os.Exit(1) }
 	for {
 		conn, err := listener.Accept()
 		if err == nil { go handleControlConnection(conn) }
