@@ -1,6 +1,6 @@
 #!/bin/bash
 # G-Tun Setup and Installation Script
-# This script configures and installs G-Tun as a systemd service.
+# Automatically generates a secure 64-character token on server installation.
 
 set -e
 
@@ -21,12 +21,6 @@ read -p "Enter choice [1 or 2]: " SETUP_TYPE
 read -p "Enter Control Port (default 8080): " CONTROL_PORT
 CONTROL_PORT=${CONTROL_PORT:-8080}
 
-read -p "Enter Secret Token for Authentication: " SECRET_TOKEN
-if [ -z "$SECRET_TOKEN" ]; then
-    echo "Error: Token cannot be empty."
-    exit 1
-fi
-
 read -p "Select Protocol (tcp, udp, ws, wss) [default tcp]: " PROTOCOL
 PROTOCOL=${PROTOCOL:-tcp}
 
@@ -40,6 +34,14 @@ if [ "$SETUP_TYPE" == "1" ]; then
     read -p "Enter Data Port for Tunnel (default 8081): " DATA_PORT
     DATA_PORT=${DATA_PORT:-8081}
 
+    # Generate a cryptographically secure 64-character hex token
+    echo "Generating secure 64-character token..."
+    if command -v openssl >/dev/null 2>&1; then
+        SECRET_TOKEN=$(openssl rand -hex 32)
+    else
+        SECRET_TOKEN=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64)
+    fi
+
     cat <<EOF > /etc/g-tun/server_config.json
 {
     "control_port": "$CONTROL_PORT",
@@ -50,7 +52,7 @@ if [ "$SETUP_TYPE" == "1" ]; then
 }
 EOF
 
-    echo "Building Server..."
+    echo "Building Server Binary..."
     cd server && go build -o g-tun-server server.go
     mv g-tun-server /usr/local/bin/
 
@@ -74,17 +76,39 @@ EOF
     systemctl daemon-reload
     systemctl enable g-tun-server
     systemctl restart g-tun-server
-    echo "Server setup complete and running in background!"
+    
+    # Visual layout to expose the generated token clearly to the admin
+    echo " "
+    echo "=========================================================================="
+    echo "                     SERVER INSTALLATION SUCCESSFUL                       "
+    echo "=========================================================================="
+    echo " Copy the 64-character token below and use it during client installation: "
+    echo " "
+    echo " TOKEN: $SECRET_TOKEN"
+    echo " "
+    echo "=========================================================================="
+    echo " "
 
 elif [ "$SETUP_TYPE" == "2" ]; then
     # Client Setup
     read -p "Enter Server IP Address: " SERVER_IP
+    if [ -z "$SERVER_IP" ]; then
+        echo "Error: Server IP cannot be empty."
+        exit 1
+    fi
     
     read -p "Enter Server Data Port (default 8081): " DATA_PORT
     DATA_PORT=${DATA_PORT:-8081}
 
     read -p "Enter Local Port to Listen on (default 1080): " LOCAL_PORT
     LOCAL_PORT=${LOCAL_PORT:-1080}
+
+    # Request the generated token from the user
+    read -p "Paste the 64-character Token from Server: " SECRET_TOKEN
+    if [ -z "$SECRET_TOKEN" ] || [ ${#SECRET_TOKEN} -lt 32 ]; then
+        echo "Error: Invalid token. Token must be provided and securely long."
+        exit 1
+    fi
 
     cat <<EOF > /etc/g-tun/client_config.json
 {
@@ -96,7 +120,7 @@ elif [ "$SETUP_TYPE" == "2" ]; then
 }
 EOF
 
-    echo "Building Client..."
+    echo "Building Client Binary..."
     cd client && go build -o g-tun-client client.go
     mv g-tun-client /usr/local/bin/
 
