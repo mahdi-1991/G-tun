@@ -1,294 +1,104 @@
 #!/bin/bash
+# G-Tun Full Control Panel
 
-# ===================================================
-#   G-Tun Management Script
-#   Powered by Go & Systemd
-# ===================================================
-
-
-INSTALL_DIR="/usr/local/g-tun"
-GO_BIN="/usr/local/go/bin/go"
-SERVICE_NAME="g-tun"
-SCREEN_NAME="g-tun_console"
-
-# --- Colors ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
+YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
-NC='\033[0m'
+NC='\033[0m' 
 
-# --- Core Functions ---
-
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}Please run as root (sudo).${NC}"
-        exit 1
-    fi
-}
-
-install_deps() {
-    echo -e "${YELLOW}[G-Tun] Installing System Dependencies...${NC}"
-    apt update -q && apt install -y -q git curl wget tar lsof psmisc nano screen net-tools vnstat
-
-    # Check if Go is installed
-    if [ ! -f "$GO_BIN" ]; then
-        echo -e "${YELLOW}[G-Tun] Go not found. Installing Go 1.23.1...${NC}"
-        
-        # Clean previous attempts
-        rm -f go1.23.1.linux-amd64.tar.gz
-
-        # ---------------------------------------------------------
-        # METHOD 1: Official Server
-        # ---------------------------------------------------------
-        echo -e "Attempt 1: Downloading from Official Server..."
-        if wget -q --show-progress --progress=bar:force https://go.dev/dl/go1.23.1.linux-amd64.tar.gz; then
-            echo -e "${GREEN}Download successful from Official Server.${NC}"
-        
-        # ---------------------------------------------------------
-        # METHOD 2: GitHub Repository (Fallback)
-        # ---------------------------------------------------------
-        else
-            echo -e "${RED}Official server failed.${NC}"
-            echo -e "${YELLOW}Attempt 2: Downloading from YOUR GitHub Repository...${NC}"
-            
-            # Construct Raw URL
-            REPO_FILE_URL="https://raw.githubusercontent.com/mahdi-1991/G-tun/refs/heads/main/go1.23.1.linux-amd64.tar.gz"
-            
-            if wget -q --show-progress --progress=bar:force "$REPO_FILE_URL"; then
-                echo -e "${GREEN}Download successful from GitHub Repo.${NC}"
-            else
-                echo -e "${RED}Critical Error: Failed to download Go from GitHub too!${NC}"
-                echo -e "Check if file 'go1.23.1.linux-amd64.tar.gz' exists in your repo root."
-                exit 1
-            fi
-        fi
-
-        # Extracting
-        echo -e "${YELLOW}Extracting Go...${NC}"
-        rm -rf /usr/local/go && tar -C /usr/local -xzf go1.23.1.linux-amd64.tar.gz
-        rm go1.23.1.linux-amd64.tar.gz
-        export PATH=$PATH:/usr/local/go/bin
-    fi
-
-    # Generate TLS Certs if missing
-    if [ ! -f "$INSTALL_DIR/server/cert.pem" ]; then
-        echo -e "${YELLOW}[G-Tun] Generating TLS Certificates...${NC}"
-        cd "$INSTALL_DIR/server" && "$GO_BIN" run generate_cert.go
-    fi
-
-    echo -e "${YELLOW}[G-Tun] Fixing Go Modules...${NC}"
-    export PATH=$PATH:/usr/local/go/bin
-    
-    for dir in "$INSTALL_DIR/server" "$INSTALL_DIR/client"; do
-        cd "$dir"
-        if [ -f "go.mod" ]; then
-            "$GO_BIN" mod tidy 2>/dev/null
-            "$GO_BIN" get github.com/gorilla/websocket
-            "$GO_BIN" get github.com/xtaci/kcp-go/v5
-            "$GO_BIN" get github.com/xtaci/smux
-        fi
-    done
-
-    echo -e "${YELLOW}[G-Tun] Building Binaries...${NC}"
-    
-    # Build Server
-    cd "$INSTALL_DIR/server"
-    if "$GO_BIN" build -o g-tun-server server.go; then
-        echo -e "${GREEN}✔ Server Built Successfully${NC}"
-    else
-        echo -e "${RED}✘ Server Build Failed!${NC}"; exit 1
-    fi
-
-    # Build Client
-    cd "$INSTALL_DIR/client"
-    if "$GO_BIN" build -o g-tun-client client.go; then
-        echo -e "${GREEN}✔ Client Built Successfully${NC}"
-    else
-        echo -e "${RED}✘ Client Build Failed!${NC}"; exit 1
-    fi
-
-    chmod +x "$INSTALL_DIR/server/g-tun-server"
-    chmod +x "$INSTALL_DIR/client/g-tun-client"
-}
-
-create_service() {
-    local role=$1
-    local exec_cmd=""
-    local work_dir=""
-
-    if [ "$role" == "client" ]; then
-        work_dir="$INSTALL_DIR/client"
-        exec_cmd="./g-tun-client"
-    else
-        work_dir="$INSTALL_DIR/server"
-        exec_cmd="./g-tun-server"
-    fi
-
-    if [ ! -f "$work_dir/g-tun-$role" ]; then
-         echo -e "${RED}Error: Binary not found. Run Install/Build first.${NC}"
-         return
-    fi
-
-    echo -e "${YELLOW}[G-Tun] Creating Service for $role...${NC}"
-
-    # Use 'sleep 10' to keep screen open on crash for debugging
-    cat <<EOF > /etc/systemd/system/$SERVICE_NAME.service
-[Unit]
-Description=G-Tun Service ($role)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=$work_dir
-ExecStart=/usr/bin/screen -DmS $SCREEN_NAME /bin/bash -c "$exec_cmd || sleep 10"
-ExecStop=/usr/bin/screen -S $SCREEN_NAME -X quit
-Restart=always
-RestartSec=3s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable $SERVICE_NAME
-    echo -e "${GREEN}✔ Service Installed & Enabled.${NC}"
-}
-
-configure() {
-    echo -e "${BLUE}=== G-Tun Configuration ===${NC}"
-    echo "1) Iran (Client)"
-    echo "2) Foreign (Server)"
-    read -p "Select Role: " role
-
-    if [ "$role" == "1" ]; then
-        # CLIENT
-        read -p "Foreign IP: " ip
-        read -p "Foreign Control Port [8880]: " cport; cport=${cport:-8880}
-        read -p "Local Proxy Port [2054]: " lport; lport=${lport:-2054}
-
-        cat <<EOF > "$INSTALL_DIR/client/client_config.json"
-{
-    "ControlServerAddress": "$ip:$cport",
-    "LocalListenPort": "0.0.0.0:$lport",
-    "RemoteServerIP": "$ip",
-    "KcpConfig": { "NoDelay": 1, "Interval": 10, "Resend": 2, "NoCongestion": 1, "SndWnd": 1024, "RcvWnd": 1024, "DataShards": 10, "ParityShards": 3 }
-}
-EOF
-        create_service "client"
-
-    elif [ "$role" == "2" ]; then
-        # SERVER
-        read -p "Listen Control Port [8880]: " cport; cport=${cport:-8880}
-        read -p "Target Xray Address [127.0.0.1:1080]: " target; target=${target:-127.0.0.1:1080}
-
-        echo -e "${YELLOW}Clearing port $cport...${NC}"
-        fuser -k -n tcp $cport 2> /dev/null
-
-        cat <<EOF > "$INSTALL_DIR/server/server_config.json"
-{
-    "ControlPort": "$cport",
-    "DataPorts": { "TCP": "9091", "UDP": "9092", "WS": "9093", "TCPMux": "9094", "WSMux": "9095", "WSS": "9096", "WSSMux": "9097", "UTCPMux": "9098" },
-    "XrayInboundAddress": "$target",
-    "TlsCertPath": "cert.pem", "TlsKeyPath": "key.pem",
-    "KcpConfig": { "NoDelay": 1, "Interval": 10, "Resend": 2, "NoCongestion": 1, "SndWnd": 1024, "RcvWnd": 1024, "DataShards": 10, "ParityShards": 3 }
-}
-EOF
-        create_service "server"
-    fi
-    echo -e "${GREEN}✔ Config Saved.${NC}"
-}
-
-enter_console() {
-    echo -e "${YELLOW}Connecting to G-Tun Console...${NC}"
-    sleep 2
-    
-    if screen -list | grep -q "$SCREEN_NAME"; then
-        echo -e "${CYAN}-------------------------------------------------------${NC}"
-        echo -e " >> Wait for 'Client Connected' -> Select Protocol"
-        echo -e " >> To EXIT keeping tunnel alive: Press ${GREEN}Ctrl+A${NC} then ${GREEN}D${NC}"
-        echo -e "${CYAN}-------------------------------------------------------${NC}"
-        read -p "Press Enter..."
-        screen -r $SCREEN_NAME
-    else
-        echo -e "${RED}Error: Service not running or crashed.${NC}"
-        journalctl -u $SERVICE_NAME -n 10 --no-pager
-    fi
-}
-
-start_tunnel() {
-    systemctl stop $SERVICE_NAME
-    killall -9 g-tun-server g-tun-client 2>/dev/null
-    systemctl start $SERVICE_NAME
-    echo -e "${GREEN}✔ Service Started.${NC}"
-    
-    # Auto-Console for Server
-    if [ -f "$INSTALL_DIR/server/server_config.json" ]; then
-        if grep -q "ControlPort" "$INSTALL_DIR/server/server_config.json"; then
-             enter_console
-        else
-             echo -e "${BLUE}Client running in background.${NC}"
-        fi
-    fi
-}
-
-stop_tunnel() {
-    systemctl stop $SERVICE_NAME
-    screen -S $SCREEN_NAME -X quit 2>/dev/null
-    echo -e "${RED}Tunnel Stopped.${NC}"
-}
-
-status_panel() {
-    echo -e "\n${BLUE}=== G-Tun Status ===${NC}"
-    systemctl is-active --quiet $SERVICE_NAME && echo -e "Service: ${GREEN}Active ●${NC}" || echo -e "Service: ${RED}Inactive ●${NC}"
-    echo -e "--- Ports ---"
-    netstat -tulpn | grep -E 'g-tun'
-}
-
-uninstall() {
-    read -p "Are you sure? (y/n): " confirm
-    if [[ "$confirm" == "y" ]]; then
-        stop_tunnel
-        systemctl disable $SERVICE_NAME
-        rm /etc/systemd/system/$SERVICE_NAME.service
-        systemctl daemon-reload
-        rm -rf "$INSTALL_DIR"
-        rm /usr/bin/g-tun
-        echo -e "${RED}G-Tun Uninstalled Completely.${NC}"
-        exit 0
-    fi
-}
-
-# --- Main Menu ---
-check_root
-
-# If script is run with 'install' arg (internal use)
-if [ "$1" == "install" ]; then
-    install_deps
-    exit 0
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}Please run as root.${NC}"
+  exit 1
 fi
 
-while true; do
-    echo -e "\n${CYAN}   G-Tun Manager v1.0   ${NC}"
-    echo -e "${BLUE}========================${NC}"
-    echo "1) Re-Install / Update / Fix Build"
-    echo "2) Configure (Server/Client)"
-    echo "3) Start Tunnel"
-    echo "4) Stop Tunnel"
-    echo "5) Status"
-    echo "6) Uninstall"
-    echo "0) Exit"
-    echo -e "${BLUE}========================${NC}"
-    read -p "Select: " opt
-    case $opt in
-        1) install_deps ;;
-        2) configure ;;
-        3) start_tunnel ;;
-        4) stop_tunnel ;;
-        5) status_panel ;;
-        6) uninstall ;;
-        0) exit 0 ;;
+# Detect if the current machine is Server or Client
+if [ -f "/etc/systemd/system/g-tun-server.service" ]; then
+    ROLE="Server"
+    SVC="g-tun-server"
+    CONF="/etc/g-tun/server_config.json"
+elif [ -f "/etc/systemd/system/g-tun-client.service" ]; then
+    ROLE="Client"
+    SVC="g-tun-client"
+    CONF="/etc/g-tun/client_config.json"
+else
+    echo -e "${RED}Error: G-Tun is not installed. Please run install.sh first.${NC}"
+    exit 1
+fi
+
+show_menu() {
+    clear
+    echo -e "${CYAN}==========================================${NC}"
+    echo -e "${GREEN}        G-TUN FULL CONTROL PANEL        ${NC}"
+    echo -e "${CYAN}==========================================${NC}"
+    
+    STATUS=$(systemctl is-active $SVC || true)
+    if [ "$STATUS" == "active" ]; then
+        echo -e " Mode:   [${YELLOW}$ROLE${NC}]"
+        echo -e " Status: [${GREEN}RUNNING${NC}]"
+    else
+        echo -e " Mode:   [${YELLOW}$ROLE${NC}]"
+        echo -e " Status: [${RED}STOPPED${NC}]"
+    fi
+    echo -e "${CYAN}------------------------------------------${NC}"
+    echo " 1) Start G-Tun Service"
+    echo " 2) Stop G-Tun Service"
+    echo " 3) Restart G-Tun Service"
+    echo " 4) View Live Logs (Press Ctrl+C to exit)"
+    echo " 5) View Full Configuration"
+    echo " 6) Show Secret Token"
+    echo " 7) Edit Configuration (Requires Restart)"
+    echo " 0) Exit Panel"
+    echo -e "${CYAN}==========================================${NC}"
+    read -p " Enter your choice [0-7]: " CHOICE
+
+    case $CHOICE in
+        1) 
+            systemctl start $SVC
+            echo -e "${GREEN}Service Started.${NC}"
+            sleep 1; show_menu 
+            ;;
+        2) 
+            systemctl stop $SVC
+            echo -e "${RED}Service Stopped.${NC}"
+            sleep 1; show_menu 
+            ;;
+        3) 
+            systemctl restart $SVC
+            echo -e "${YELLOW}Service Restarted.${NC}"
+            sleep 1; show_menu 
+            ;;
+        4) 
+            echo -e "${YELLOW}Fetching logs... Press Ctrl+C to stop.${NC}"
+            journalctl -u $SVC -f 
+            ;;
+        5) 
+            echo -e "\n${CYAN}--- Current Configuration ---${NC}"
+            cat $CONF
+            echo ""
+            read -p "Press Enter to return..." key
+            show_menu 
+            ;;
+        6) 
+            TOKEN=$(grep '"token"' $CONF | cut -d '"' -f 4)
+            echo -e "\n${YELLOW}--- Your Secret Token ---${NC}\n$TOKEN\n"
+            read -p "Press Enter to return..." key
+            show_menu 
+            ;;
+        7) 
+            nano $CONF
+            systemctl restart $SVC
+            echo -e "${GREEN}Config saved and service restarted.${NC}"
+            sleep 1; show_menu
+            ;;
+        0) 
+            clear; exit 0 
+            ;;
+        *) 
+            echo -e "${RED}Invalid choice!${NC}"
+            sleep 1; show_menu 
+            ;;
     esac
-done
+}
+
+show_menu

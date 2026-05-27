@@ -12,7 +12,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "Checking dependencies..."
-apt-get update -y && apt-get install -y git curl wget tar systemd openssl
+apt-get update -y && apt-get install -y git curl wget tar systemd openssl nano
 
 # 1. Install Go 1.23.0 safely
 if [ ! -f "/usr/local/go/bin/go" ] || ! /usr/local/go/bin/go version | grep -q "go1.23"; then
@@ -118,6 +118,10 @@ EOF
     systemctl enable g-tun-server
     systemctl restart g-tun-server
     
+    # INSTALL CONTROL MENU
+    cp /root/G-tun-Project/g-tun.sh /usr/bin/g-tun
+    chmod +x /usr/bin/g-tun
+    
     echo " "
     echo "=========================================================================="
     echo "                     SERVER INSTALLATION SUCCESSFUL                       "
@@ -127,6 +131,7 @@ EOF
     echo " "
     echo " TOKEN: $SECRET_TOKEN"
     echo " "
+    echo " You can manage the tunnel anytime by typing: g-tun"
     echo "=========================================================================="
     echo " "
 
@@ -194,8 +199,14 @@ EOF
     systemctl daemon-reload
     systemctl enable g-tun-client
     systemctl restart g-tun-client
+    
+    # INSTALL CONTROL MENU
+    cp /root/G-tun-Project/g-tun.sh /usr/bin/g-tun
+    chmod +x /usr/bin/g-tun
+    
     echo " "
     echo "=========================================================================="
     echo " Client setup complete and running in background!"
+    echo " You can manage the tunnel anytime by typing: g-tun"
     echo "=========================================================================="
 fi
