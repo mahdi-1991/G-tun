@@ -1,6 +1,6 @@
+cat << 'EOF' > /root/G-tun-Project/install.sh
 #!/bin/bash
 # G-Tun Setup and Installation Script
-
 set -e
 
 echo "=========================================="
@@ -12,30 +12,26 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# 1. Install necessary tools
 echo "Checking dependencies..."
 apt-get update -y && apt-get install -y git curl wget tar systemd
 
-# 2. Install Go 1.23.0 safely if not present or outdated
-if ! command -v go &> /dev/null || ! go version | grep -q "go1.23"; then
+# 1. Install Go 1.23.0 safely and bypass apt versions
+if [ ! -f "/usr/local/go/bin/go" ] || ! /usr/local/go/bin/go version | grep -q "go1.23"; then
     echo "Installing Go 1.23.0..."
     wget -q https://go.dev/dl/go1.23.0.linux-amd64.tar.gz -O /tmp/go1.23.0.tar.gz
     rm -rf /usr/local/go
     tar -C /usr/local -xzf /tmp/go1.23.0.tar.gz
     rm /tmp/go1.23.0.tar.gz
 fi
-export PATH=$PATH:/usr/local/go/bin
+export PATH=/usr/local/go/bin:$PATH
 
-# 3. Clone Repository
 WORK_DIR="/root/G-tun-Project"
 if [ ! -d "$WORK_DIR" ]; then
-    echo "Cloning repository..."
     git clone https://github.com/mahdi-1991/G-tun.git "$WORK_DIR"
 fi
 cd "$WORK_DIR"
 git pull origin main || true
 
-# 4. Setup Configuration
 echo "------------------------------------------"
 echo "Select setup type:"
 echo "1) Server"
@@ -70,7 +66,6 @@ if [ "$SETUP_TYPE" == "1" ]; then
     read -p "Enter Data Port for Tunnel (default 8081): " DATA_PORT
     DATA_PORT=${DATA_PORT:-8081}
 
-    # Generate a cryptographically secure 64-character hex token
     echo "Generating secure 64-character token..."
     if command -v openssl >/dev/null 2>&1; then
         SECRET_TOKEN=$(openssl rand -hex 32)
@@ -79,7 +74,7 @@ if [ "$SETUP_TYPE" == "1" ]; then
     fi
 
     mkdir -p /etc/g-tun
-    cat <<EOF > /etc/g-tun/server_config.json
+    cat <<INNER_EOF > /etc/g-tun/server_config.json
 {
     "control_port": "$CONTROL_PORT",
     "data_port": "$DATA_PORT",
@@ -93,15 +88,17 @@ if [ "$SETUP_TYPE" == "1" ]; then
         "SndWnd": 1024, "RcvWnd": 1024, "DataShards": 10, "ParityShards": 3
     }
 }
-EOF
+INNER_EOF
 
     echo "Building Server Binary..."
     cd server
-    go mod tidy
-    go build -o g-tun-server server.go
+    
+    # 2. Using absolute path to guarantee Go 1.23 is used
+    /usr/local/go/bin/go mod tidy
+    /usr/local/go/bin/go build -o g-tun-server server.go
     mv g-tun-server /usr/local/bin/
 
-    cat <<EOF > /etc/systemd/system/g-tun-server.service
+    cat <<INNER_EOF > /etc/systemd/system/g-tun-server.service
 [Unit]
 Description=G-Tun Server Service
 After=network.target
@@ -117,7 +114,7 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-EOF
+INNER_EOF
 
     systemctl daemon-reload
     systemctl enable g-tun-server
@@ -149,7 +146,6 @@ elif [ "$SETUP_TYPE" == "2" ]; then
     read -p "Enter Local Port to Listen on (default 1080): " LOCAL_PORT
     LOCAL_PORT=${LOCAL_PORT:-1080}
 
-    # Request the generated token from the user securely (No Defaults)
     echo "------------------------------------------"
     read -p "Paste the 64-character Token from Server: " SECRET_TOKEN
     if [ -z "$SECRET_TOKEN" ] || [ ${#SECRET_TOKEN} -lt 32 ]; then
@@ -158,7 +154,7 @@ elif [ "$SETUP_TYPE" == "2" ]; then
     fi
 
     mkdir -p /etc/g-tun
-    cat <<EOF > /etc/g-tun/client_config.json
+    cat <<INNER_EOF > /etc/g-tun/client_config.json
 {
     "control_server_address": "$SERVER_IP:$CONTROL_PORT",
     "remote_server_ip": "$SERVER_IP",
@@ -170,15 +166,17 @@ elif [ "$SETUP_TYPE" == "2" ]; then
         "SndWnd": 1024, "RcvWnd": 1024, "DataShards": 10, "ParityShards": 3
     }
 }
-EOF
+INNER_EOF
 
     echo "Building Client Binary..."
     cd client
-    go mod tidy
-    go build -o g-tun-client client.go
+    
+    # 2. Using absolute path to guarantee Go 1.23 is used
+    /usr/local/go/bin/go mod tidy
+    /usr/local/go/bin/go build -o g-tun-client client.go
     mv g-tun-client /usr/local/bin/
 
-    cat <<EOF > /etc/systemd/system/g-tun-client.service
+    cat <<INNER_EOF > /etc/systemd/system/g-tun-client.service
 [Unit]
 Description=G-Tun Client Service
 After=network.target
@@ -194,7 +192,7 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-EOF
+INNER_EOF
 
     systemctl daemon-reload
     systemctl enable g-tun-client
@@ -204,3 +202,7 @@ EOF
     echo " Client setup complete and running in background!"
     echo "=========================================================================="
 fi
+EOF
+
+cd /root/G-tun-Project
+bash install.sh
