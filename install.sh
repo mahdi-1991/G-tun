@@ -1,45 +1,124 @@
 #!/bin/bash
+# G-Tun Setup and Installation Script
+# This script configures and installs G-Tun as a systemd service.
 
-REPO_URL="https://github.com/mahdi-1991/G-tun.git"
-INSTALL_DIR="/usr/local/g-tun"
-BIN_LINK="/usr/bin/g-tun"
+set -e
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+echo "=========================================="
+echo "          G-Tun Setup Wizard              "
+echo "=========================================="
 
-echo -e "${GREEN}Welcome to G-Tun Installer...${NC}"
-
-if ! command -v git &> /dev/null; then
-    echo -e "${YELLOW}Installing Git...${NC}"
-    apt update -q && apt install -y -q git
-fi
-if [ -d "$INSTALL_DIR" ]; then
-    echo -e "${YELLOW}Cleaning up old/broken installation...${NC}"
-    rm -rf "$INSTALL_DIR"
+if [ "$EUID" -ne 0 ]; then
+  echo "Error: Please run this script as root."
+  exit 1
 fi
 
-echo -e "${GREEN}Cloning repository...${NC}"
-git clone "$REPO_URL" "$INSTALL_DIR"
+echo "Select setup type:"
+echo "1) Server"
+echo "2) Client"
+read -p "Enter choice [1 or 2]: " SETUP_TYPE
 
-if [ ! -f "$INSTALL_DIR/g-tun.sh" ]; then
-    echo -e "${RED}Error: Clone failed! Repository not found or empty.${NC}"
-    echo -e "Check this URL manually: $REPO_URL"
+read -p "Enter Control Port (default 8080): " CONTROL_PORT
+CONTROL_PORT=${CONTROL_PORT:-8080}
+
+read -p "Enter Secret Token for Authentication: " SECRET_TOKEN
+if [ -z "$SECRET_TOKEN" ]; then
+    echo "Error: Token cannot be empty."
     exit 1
 fi
 
-chmod +x "$INSTALL_DIR/g-tun.sh"
+read -p "Select Protocol (tcp, udp, ws, wss) [default tcp]: " PROTOCOL
+PROTOCOL=${PROTOCOL:-tcp}
 
-rm -f "$BIN_LINK"
-ln -s "$INSTALL_DIR/g-tun.sh" "$BIN_LINK"
+mkdir -p /etc/g-tun
 
-echo -e "${GREEN}G-Tun core installed successfully!${NC}"
-echo -e "${YELLOW}Installing dependencies...${NC}"
+if [ "$SETUP_TYPE" == "1" ]; then
+    # Server Setup
+    read -p "Enter Xray/Destination Port (default 10085): " XRAY_PORT
+    XRAY_PORT=${XRAY_PORT:-10085}
 
-g-tun install
+    read -p "Enter Data Port for Tunnel (default 8081): " DATA_PORT
+    DATA_PORT=${DATA_PORT:-8081}
 
-echo -e "\n${GREEN}Installation Finished!${NC}"
-echo -e "Type ${RED}g-tun${NC} to open the menu."
+    cat <<EOF > /etc/g-tun/server_config.json
+{
+    "control_port": "$CONTROL_PORT",
+    "data_port": "$DATA_PORT",
+    "xray_port": "$XRAY_PORT",
+    "protocol": "$PROTOCOL",
+    "token": "$SECRET_TOKEN"
+}
+EOF
 
-g-tun
+    echo "Building Server..."
+    cd server && go build -o g-tun-server server.go
+    mv g-tun-server /usr/local/bin/
+
+    cat <<EOF > /etc/systemd/system/g-tun-server.service
+[Unit]
+Description=G-Tun Server Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/g-tun-server -config /etc/g-tun/server_config.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable g-tun-server
+    systemctl restart g-tun-server
+    echo "Server setup complete and running in background!"
+
+elif [ "$SETUP_TYPE" == "2" ]; then
+    # Client Setup
+    read -p "Enter Server IP Address: " SERVER_IP
+    
+    read -p "Enter Server Data Port (default 8081): " DATA_PORT
+    DATA_PORT=${DATA_PORT:-8081}
+
+    read -p "Enter Local Port to Listen on (default 1080): " LOCAL_PORT
+    LOCAL_PORT=${LOCAL_PORT:-1080}
+
+    cat <<EOF > /etc/g-tun/client_config.json
+{
+    "server_ip": "$SERVER_IP",
+    "control_port": "$CONTROL_PORT",
+    "data_port": "$DATA_PORT",
+    "local_port": "$LOCAL_PORT",
+    "token": "$SECRET_TOKEN"
+}
+EOF
+
+    echo "Building Client..."
+    cd client && go build -o g-tun-client client.go
+    mv g-tun-client /usr/local/bin/
+
+    cat <<EOF > /etc/systemd/system/g-tun-client.service
+[Unit]
+Description=G-Tun Client Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/g-tun-client -config /etc/g-tun/client_config.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable g-tun-client
+    systemctl restart g-tun-client
+    echo "Client setup complete and running in background!"
+fi
