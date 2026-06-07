@@ -300,8 +300,9 @@ func startQuicDataListener() {
 	}
 
 	quicConfig := &quic.Config{
-		KeepAlivePeriod: 15 * time.Second,
-		MaxIdleTimeout:  30 * time.Second,
+		KeepAlivePeriod:    10 * time.Second,
+		MaxIdleTimeout:     5 * time.Minute,
+		MaxIncomingStreams: 10000,
 	}
 
 	listener, err := quic.ListenAddr("0.0.0.0:"+config.DataPort, tlsConf, quicConfig)
@@ -313,18 +314,19 @@ func startQuicDataListener() {
 
 	for {
 		conn, err := listener.Accept(context.Background())
-		if err == nil {
-			go func(c quic.Connection) {
-				for {
-					stream, err := c.AcceptStream(context.Background())
-					if err != nil {
-						break
-					}
-					// QUIC streams natively implement io.ReadWriteCloser!
-					go handleMuxStream(stream)
-				}
-			}(conn)
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
+		go func(c quic.Connection) {
+			for {
+				stream, err := c.AcceptStream(context.Background())
+				if err != nil {
+					break
+				}
+				go handleMuxStream(stream)
+			}
+		}(conn)
 	}
 }
 
