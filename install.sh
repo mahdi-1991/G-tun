@@ -36,7 +36,6 @@ EOF
 tune_system
 # ===============================================
 
-# 1. Install Go 1.23.0 safely
 if [ ! -f "/usr/local/go/bin/go" ] || ! /usr/local/go/bin/go version | grep -q "go1.23"; then
     echo "Installing Go 1.23.0..."
     wget -q https://go.dev/dl/go1.23.0.linux-amd64.tar.gz -O /tmp/go1.23.0.tar.gz
@@ -65,14 +64,15 @@ CONTROL_PORT=${CONTROL_PORT:-8080}
 mkdir -p /etc/g-tun
 
 if [ "$SETUP_TYPE" == "1" ]; then
-    # ================== SERVER SETUP ==================
     echo "------------------------------------------"
     echo "Select Protocol:"
     echo "1) tcp    2) udp      3) ws       4) tcpmux"
     echo "5) wsmux  6) wss      7) wssmux   8) utcpmux (KCP)"
-    read -p "Enter choice [1-8] (default 1): " PROTO_CHOICE
+    echo "9) quic (HTTP/3 - Best for Anti-Censorship)"
+    read -p "Enter choice [1-9] (default 9): " PROTO_CHOICE
     
     case $PROTO_CHOICE in
+        1) PROTOCOL="tcp" ;;
         2) PROTOCOL="udp" ;;
         3) PROTOCOL="ws" ;;
         4) PROTOCOL="tcpmux" ;;
@@ -80,7 +80,7 @@ if [ "$SETUP_TYPE" == "1" ]; then
         6) PROTOCOL="wss" ;;
         7) PROTOCOL="wssmux" ;;
         8) PROTOCOL="utcpmux" ;;
-        *) PROTOCOL="tcp" ;;
+        *) PROTOCOL="quic" ;;
     esac
 
     read -p "Enter Xray/Destination Address (default 127.0.0.1:10085): " XRAY_ADDR
@@ -89,7 +89,6 @@ if [ "$SETUP_TYPE" == "1" ]; then
     read -p "Enter Data Port for Tunnel (default 8081): " DATA_PORT
     DATA_PORT=${DATA_PORT:-8081}
 
-    # Preserve token if updating
     if [ -f /etc/g-tun/server_config.json ]; then
         SECRET_TOKEN=$(cat /etc/g-tun/server_config.json | grep '"token"' | cut -d '"' -f 4)
     fi
@@ -105,7 +104,7 @@ if [ "$SETUP_TYPE" == "1" ]; then
 
     echo "Checking TLS Certificates..."
     if [ ! -s /etc/g-tun/cert.pem ] || [ ! -s /etc/g-tun/key.pem ]; then
-        echo "Generating new ECC Certificates for WSS..."
+        echo "Generating new ECC Certificates for WSS & QUIC..."
         cd /root/G-tun-Project/server
         /usr/local/go/bin/go run generate_cert.go
         cp cert.pem /etc/g-tun/cert.pem
@@ -133,6 +132,7 @@ EOF
     echo "Building Server Binary..."
     cd /root/G-tun-Project/server
     
+    /usr/local/go/bin/go get github.com/quic-go/quic-go
     /usr/local/go/bin/go mod tidy
     /usr/local/go/bin/go build -o g-tun-server server.go
     mv g-tun-server /usr/local/bin/
@@ -161,7 +161,6 @@ EOF
     systemctl enable g-tun-server
     systemctl restart g-tun-server
     
-    # INSTALL CONTROL MENU
     cp /root/G-tun-Project/g-tun.sh /usr/bin/g-tun
     chmod +x /usr/bin/g-tun
     
@@ -185,7 +184,6 @@ EOF
     echo " "
 
 elif [ "$SETUP_TYPE" == "2" ]; then
-    # ================== CLIENT SETUP ==================
     read -p "Enter Server IP Address: " SERVER_IP
     if [ -z "$SERVER_IP" ]; then
         echo "Error: Server IP cannot be empty."
@@ -198,7 +196,6 @@ elif [ "$SETUP_TYPE" == "2" ]; then
     read -p "Enter Local Port to Listen on (default 1080): " LOCAL_PORT
     LOCAL_PORT=${LOCAL_PORT:-1080}
 
-    # Preserve token if updating
     if [ -f /etc/g-tun/client_config.json ]; then
         EXISTING_TOKEN=$(cat /etc/g-tun/client_config.json | grep '"token"' | cut -d '"' -f 4)
     fi
@@ -211,11 +208,6 @@ elif [ "$SETUP_TYPE" == "2" ]; then
         read -p "Paste the 64-character Token from Server: " SECRET_TOKEN
     fi
 
-    if [ -z "$SECRET_TOKEN" ] || [ ${#SECRET_TOKEN} -lt 32 ]; then
-        echo "Error: Invalid token. Token must be provided and securely long."
-        exit 1
-    fi
-
     if [ ! -s /etc/g-tun/cert.pem ]; then
         echo "------------------------------------------"
         echo "MITM Protection requires the Server's Certificate (cert.pem)."
@@ -223,14 +215,9 @@ elif [ "$SETUP_TYPE" == "2" ]; then
         echo "then press Ctrl+O, Enter, and Ctrl+X to save and exit."
         read -p "Press ENTER to continue..."
         nano /etc/g-tun/cert.pem
-        
-        if [ ! -s /etc/g-tun/cert.pem ]; then
-            echo "Warning: Certificate is empty! WSS/WSSMUX protocols will fail to connect."
-        fi
     else
         echo "------------------------------------------"
         echo "Found existing cert.pem in /etc/g-tun/. Skipping certificate prompt."
-        echo "If you changed the server certificate, please delete /etc/g-tun/cert.pem and run this again."
     fi
 
     cat <<EOF > /etc/g-tun/client_config.json
@@ -250,6 +237,7 @@ EOF
     echo "Building Client Binary..."
     cd /root/G-tun-Project/client
     
+    /usr/local/go/bin/go get github.com/quic-go/quic-go
     /usr/local/go/bin/go mod tidy
     /usr/local/go/bin/go build -o g-tun-client client.go
     mv g-tun-client /usr/local/bin/
@@ -278,11 +266,9 @@ EOF
     systemctl enable g-tun-client
     systemctl restart g-tun-client
     
-    # INSTALL CONTROL MENU
     cp /root/G-tun-Project/g-tun.sh /usr/bin/g-tun
     chmod +x /usr/bin/g-tun
     
-    echo " "
     echo "=========================================================================="
     echo " Client setup complete and running in background!"
     echo " You can manage the tunnel anytime by typing: g-tun"

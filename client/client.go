@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
@@ -13,13 +14,13 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/quic-go/quic-go"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 )
@@ -309,6 +310,73 @@ func handleLocalMuxConnection(lconn net.Conn, session *smux.Session) {
 	relayConnections(lconn, stream)
 }
 
+func startQuicDataForwarder(dataPort string) {
+	localCertPEM, err := os.ReadFile("cert.pem")
+	if err != nil {
+		logInfo("Error reading cert.pem. QUIC protection requires the server certificate.")
+		return
+	}
+
+	block, _ := pem.Decode(localCertPEM)
+	if block == nil {
+		logInfo("Invalid cert.pem format")
+		return
+	}
+	expectedCertDER := block.Bytes
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"gtun-quic"},
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if !bytes.Equal(rawCerts[0], expectedCertDER) {
+				return fmt.Errorf("MITM Attack Detected! Server certificate does not match cert.pem")
+			}
+			return nil
+		},
+	}
+
+	conn, err := quic.DialAddr(context.Background(), config.RemoteServerIP+":"+dataPort, tlsConf, &quic.Config{
+		KeepAlivePeriod: 15 * time.Second,
+		MaxIdleTimeout:  30 * time.Second,
+	})
+	if err != nil {
+		logInfo("QUIC Dial Error: " + err.Error())
+		return
+	}
+
+	listener, err := net.Listen("tcp", config.LocalListenPort)
+	if err != nil {
+		logInfo("Local Listen Error: " + err.Error())
+		conn.CloseWithError(0, "listen failed")
+		return
+	}
+
+	mu.Lock()
+	activeListener = listener
+	activeSession = quicSessionWrapper{conn}
+	mu.Unlock()
+
+	logInfo("Ready! Listening locally on " + config.LocalListenPort + " for QUIC traffic.")
+	for {
+		localConn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		setKeepAlive(localConn)
+		go func(lconn net.Conn) {
+			defer lconn.Close()
+			stream, err := conn.OpenStreamSync(context.Background())
+			if err != nil {
+				logInfo("QUIC Stream Open Error: " + err.Error())
+				return
+			}
+			defer stream.Close()
+			go relayConnections(stream, lconn)
+			relayConnections(lconn, stream)
+		}(localConn)
+	}
+}
+
 func startTcpMuxDataForwarder(dataPort string) {
 	baseConn, err := net.Dial("tcp", config.RemoteServerIP+":"+dataPort)
 	if err != nil {
@@ -547,7 +615,6 @@ func main() {
 
 		reader := bufio.NewReader(conn)
 
-		// 1. Get Challenge
 		challengeStr, err := reader.ReadString('\n')
 		if err != nil {
 			conn.Close()
@@ -555,15 +622,12 @@ func main() {
 		}
 		challenge := []byte(strings.TrimPrefix(strings.TrimSuffix(challengeStr, "\n"), "\r"))
 
-		// 2. Calculate HMAC
 		mac := hmac.New(sha256.New, []byte(config.Token))
 		mac.Write(challenge)
 		responseHex := hex.EncodeToString(mac.Sum(nil))
 
-		// 3. Send Response
 		conn.Write([]byte(responseHex + "\n"))
 
-		// 4. Wait for command
 		msgStr, err := reader.ReadString('\n')
 		if err != nil {
 			conn.Close()
@@ -585,22 +649,15 @@ func main() {
 			logInfo("Starting protocol: " + configData.Protocol)
 
 			switch configData.Protocol {
-			case "tcp":
-				go startTcpDataForwarder(configData.Port)
-			case "udp":
-				go startUdpDataForwarder(configData.Port)
-			case "ws":
-				go startWsDataForwarder(configData.Port)
-			case "tcpmux":
-				go startTcpMuxDataForwarder(configData.Port)
-			case "wsmux":
-				go startWsMuxDataForwarder(configData.Port)
-			case "wss":
-				go startWssDataForwarder(configData.Port)
-			case "wssmux":
-				go startWssMuxDataForwarder(configData.Port)
-			case "utcpmux":
-				go startUtcpMuxDataForwarder(configData.Port)
+			case "tcp": go startTcpDataForwarder(configData.Port)
+			case "udp": go startUdpDataForwarder(configData.Port)
+			case "ws": go startWsDataForwarder(configData.Port)
+			case "tcpmux": go startTcpMuxDataForwarder(configData.Port)
+			case "wsmux": go startWsMuxDataForwarder(configData.Port)
+			case "wss": go startWssDataForwarder(configData.Port)
+			case "wssmux": go startWssMuxDataForwarder(configData.Port)
+			case "utcpmux": go startUtcpMuxDataForwarder(configData.Port)
+			case "quic": go startQuicDataForwarder(configData.Port) // Added QUIC trigger
 			}
 		}
 

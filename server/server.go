@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/quic-go/quic-go"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 )
@@ -199,7 +202,6 @@ func startUdpDataListener() {
 		}
 		mapMutex.Unlock()
 
-		// Memory Leak Fix for UDP
 		xrayConn.SetDeadline(time.Now().Add(3 * time.Minute))
 		xrayConn.Write(buf[:n])
 	}
@@ -283,6 +285,47 @@ func handleMuxStream(stream io.ReadWriteCloser) {
 
 	go relayConnections(xrayConn, stream)
 	relayConnections(stream, xrayConn)
+}
+
+func startQuicDataListener() {
+	cert, err := tls.LoadX509KeyPair(config.TlsCertPath, config.TlsKeyPath)
+	if err != nil {
+		logInfo("QUIC TLS Load Error: " + err.Error())
+		return
+	}
+
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"gtun-quic"},
+	}
+
+	quicConfig := &quic.Config{
+		KeepAlivePeriod: 15 * time.Second,
+		MaxIdleTimeout:  30 * time.Second,
+	}
+
+	listener, err := quic.ListenAddr("0.0.0.0:"+config.DataPort, tlsConf, quicConfig)
+	if err != nil {
+		logInfo("QUIC Listen Error: " + err.Error())
+		return
+	}
+	logInfo("QUIC (HTTP/3) Listener started on port " + config.DataPort)
+
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err == nil {
+			go func(c quic.Connection) {
+				for {
+					stream, err := c.AcceptStream(context.Background())
+					if err != nil {
+						break
+					}
+					// QUIC streams natively implement io.ReadWriteCloser!
+					go handleMuxStream(stream)
+				}
+			}(conn)
+		}
+	}
 }
 
 func startTcpMuxDataListener() {
@@ -414,22 +457,15 @@ func main() {
 	logInfo("Server starting control listener on port " + config.ControlPort)
 
 	switch config.Protocol {
-	case "tcp":
-		go startTcpDataListener()
-	case "udp":
-		go startUdpDataListener()
-	case "ws":
-		go startWsDataListener()
-	case "tcpmux":
-		go startTcpMuxDataListener()
-	case "wsmux":
-		go startWsMuxDataListener()
-	case "wss":
-		go startWssDataListener()
-	case "wssmux":
-		go startWssMuxDataListener()
-	case "utcpmux":
-		go startUtcpMuxDataListener()
+	case "tcp": go startTcpDataListener()
+	case "udp": go startUdpDataListener()
+	case "ws": go startWsDataListener() // Assuming your existing WS functions are here
+	case "tcpmux": go startTcpMuxDataListener()
+	case "wsmux": go startWsMuxDataListener() // Assuming your existing WSMUX functions are here
+	case "wss": go startWssDataListener() // Assuming your existing WSS functions are here
+	case "wssmux": go startWssMuxDataListener() // Assuming your existing WSSMUX functions are here
+	case "utcpmux": go startUtcpMuxDataListener()
+	case "quic": go startQuicDataListener() // Added QUIC trigger
 	}
 
 	listener, err := net.Listen("tcp", "0.0.0.0:"+config.ControlPort)
@@ -448,15 +484,12 @@ func main() {
 func handleControlConnection(conn net.Conn) {
 	defer conn.Close()
 
-	// 1. Generate Nonce Challenge
 	challenge := make([]byte, 32)
 	rand.Read(challenge)
 
-	// 2. Send Challenge
 	conn.Write(challenge)
 	conn.Write([]byte("\n"))
 
-	// 3. Read HMAC response
 	reader := bufio.NewReader(conn)
 	clientResponseHex, err := reader.ReadString('\n')
 	if err != nil {
@@ -465,12 +498,10 @@ func handleControlConnection(conn net.Conn) {
 	}
 	clientResponseHex = strings.TrimSpace(clientResponseHex)
 
-	// 4. Calculate Expected HMAC
 	mac := hmac.New(sha256.New, []byte(config.Token))
 	mac.Write(challenge)
 	expectedResponseHex := hex.EncodeToString(mac.Sum(nil))
 
-	// 5. Secure Compare
 	if subtle.ConstantTimeCompare([]byte(clientResponseHex), []byte(expectedResponseHex)) != 1 {
 		logInfo("Unauthorized access attempt dropped.")
 		return
