@@ -1,8 +1,9 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -28,15 +29,18 @@ func main() {
 		BasicConstraintsValid: true,
 	}
 
-	pk, _ := rsa.GenerateKey(rand.Reader, 2048)
+	pk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 
 	derBytes, _ := x509.CreateCertificate(rand.Reader, &template, &template, &pk.PublicKey, pk)
+	
 	certOut, _ := os.Create("cert.pem")
 	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	certOut.Close()
 
 	keyOut, _ := os.Create("key.pem")
-	pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(pk)})
+	ecder, _ := x509.MarshalECPrivateKey(pk)
+	pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: ecder})
 	keyOut.Close()
-	println("cert.pem and key.pem generated successfully.")
+	
+	println("cert.pem and key.pem (ECC) generated successfully.")
 }

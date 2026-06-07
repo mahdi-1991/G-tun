@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"net"
@@ -115,12 +116,15 @@ func startUdpDataListener() {
 	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil { logInfo("UDP Listen Error: " + err.Error()); return }
 	logInfo("UDP Listener started on port " + config.DataPort)
+	
 	sessions := make(map[string]net.Conn)
 	var mapMutex sync.Mutex
 	buf := make([]byte, 4096)
+	
 	for {
 		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil { return }
+		
 		mapMutex.Lock()
 		xrayConn, ok := sessions[remoteAddr.String()]
 		if !ok {
@@ -130,6 +134,7 @@ func startUdpDataListener() {
 				mapMutex.Unlock(); continue 
 			}
 			sessions[remoteAddr.String()] = xrayConn
+			
 			go func(udpConn *net.UDPConn, clientAddr *net.UDPAddr, tcpConn net.Conn) {
 				tcpBufPtr := bufferPool.Get().(*[]byte)
 				defer bufferPool.Put(tcpBufPtr)
@@ -147,6 +152,8 @@ func startUdpDataListener() {
 			}(conn, remoteAddr, xrayConn)
 		}
 		mapMutex.Unlock()
+		
+		xrayConn.SetDeadline(time.Now().Add(3 * time.Minute))
 		xrayConn.Write(buf[:n])
 	}
 }
@@ -332,10 +339,18 @@ func handleControlConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	
 	clientToken, err := reader.ReadString('\n')
-	if err != nil || strings.TrimSpace(clientToken) != config.Token {
+	if err != nil {
+		logInfo("Error reading token.")
+		return
+	}
+
+	clientToken = strings.TrimSpace(clientToken)
+	
+	if subtle.ConstantTimeCompare([]byte(clientToken), []byte(config.Token)) != 1 {
 		logInfo("Unauthorized access attempt dropped.")
 		return
 	}
+	
 	logInfo("Client authenticated successfully.")
 
 	payload := fmt.Sprintf(`{"protocol":"%s","port":"%s"}`, config.Protocol, config.DataPort)
