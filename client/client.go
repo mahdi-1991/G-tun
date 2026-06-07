@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -92,6 +93,13 @@ func (c *wsConnWrapper) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// Wrapper for QUIC Connection to fit io.Closer for cleanly stopping transport
+type quicSessionWrapper struct { quic.Connection }
+
+func (q quicSessionWrapper) Close() error { 
+	return q.Connection.CloseWithError(0, "closed by gtun client") 
+}
+
 func logInfo(message string) {
 	fmt.Printf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), message)
 }
@@ -125,8 +133,6 @@ func stopTransport() {
 	}
 }
 
-// ---------------- Helper Functions ----------------
-
 func getSmuxConfig() *smux.Config {
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.KeepAliveInterval = 10 * time.Second
@@ -144,7 +150,19 @@ func setKeepAlive(conn net.Conn) {
 	}
 }
 
-// ---------------- Data Transport Functions ----------------
+func handleLocalMuxConnection(lconn net.Conn, session *smux.Session) {
+	defer lconn.Close()
+	stream, err := session.OpenStream()
+	if err != nil {
+		logInfo("Smux OpenStream Error: " + err.Error())
+		return
+	}
+	defer stream.Close()
+	go relayConnections(stream, lconn)
+	relayConnections(lconn, stream)
+}
+
+// ==== Transport Protocols ====
 
 func startTcpDataForwarder(dataPort string) {
 	listener, err := net.Listen("tcp", config.LocalListenPort)
@@ -225,7 +243,6 @@ func startUdpDataForwarder(dataPort string) {
 		}
 		mapMutex.Unlock()
 
-		// Memory Leak Fix for UDP
 		remoteConn.SetDeadline(time.Now().Add(3 * time.Minute))
 		remoteConn.Write(buf[:n])
 	}
@@ -294,85 +311,6 @@ func startWsDataForwarder(dataPort string) {
 			}
 			defer wsConn.Close()
 			relayWs(lconn, wsConn)
-		}(localConn)
-	}
-}
-
-func handleLocalMuxConnection(lconn net.Conn, session *smux.Session) {
-	defer lconn.Close()
-	stream, err := session.OpenStream()
-	if err != nil {
-		logInfo("Smux OpenStream Error: " + err.Error())
-		return
-	}
-	defer stream.Close()
-	go relayConnections(stream, lconn)
-	relayConnections(lconn, stream)
-}
-
-func startQuicDataForwarder(dataPort string) {
-	localCertPEM, err := os.ReadFile("cert.pem")
-	if err != nil {
-		logInfo("Error reading cert.pem. QUIC protection requires the server certificate.")
-		return
-	}
-
-	block, _ := pem.Decode(localCertPEM)
-	if block == nil {
-		logInfo("Invalid cert.pem format")
-		return
-	}
-	expectedCertDER := block.Bytes
-
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"gtun-quic"},
-		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			if !bytes.Equal(rawCerts[0], expectedCertDER) {
-				return fmt.Errorf("MITM Attack Detected! Server certificate does not match cert.pem")
-			}
-			return nil
-		},
-	}
-
-	conn, err := quic.DialAddr(context.Background(), config.RemoteServerIP+":"+dataPort, tlsConf, &quic.Config{
-		KeepAlivePeriod: 15 * time.Second,
-		MaxIdleTimeout:  30 * time.Second,
-	})
-	if err != nil {
-		logInfo("QUIC Dial Error: " + err.Error())
-		return
-	}
-
-	listener, err := net.Listen("tcp", config.LocalListenPort)
-	if err != nil {
-		logInfo("Local Listen Error: " + err.Error())
-		conn.CloseWithError(0, "listen failed")
-		return
-	}
-
-	mu.Lock()
-	activeListener = listener
-	activeSession = quicSessionWrapper{conn}
-	mu.Unlock()
-
-	logInfo("Ready! Listening locally on " + config.LocalListenPort + " for QUIC traffic.")
-	for {
-		localConn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		setKeepAlive(localConn)
-		go func(lconn net.Conn) {
-			defer lconn.Close()
-			stream, err := conn.OpenStreamSync(context.Background())
-			if err != nil {
-				logInfo("QUIC Stream Open Error: " + err.Error())
-				return
-			}
-			defer stream.Close()
-			go relayConnections(stream, lconn)
-			relayConnections(lconn, stream)
 		}(localConn)
 	}
 }
@@ -600,6 +538,73 @@ func startUtcpMuxDataForwarder(dataPort string) {
 	}
 }
 
+func startQuicDataForwarder(dataPort string) {
+	localCertPEM, err := os.ReadFile("cert.pem")
+	if err != nil {
+		logInfo("Error reading cert.pem. QUIC protection requires the server certificate.")
+		return
+	}
+
+	block, _ := pem.Decode(localCertPEM)
+	if block == nil {
+		logInfo("Invalid cert.pem format")
+		return
+	}
+	expectedCertDER := block.Bytes
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"gtun-quic"},
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if !bytes.Equal(rawCerts[0], expectedCertDER) {
+				return fmt.Errorf("MITM Attack Detected! Server certificate does not match cert.pem")
+			}
+			return nil
+		},
+	}
+
+	conn, err := quic.DialAddr(context.Background(), config.RemoteServerIP+":"+dataPort, tlsConf, &quic.Config{
+		KeepAlivePeriod: 15 * time.Second,
+		MaxIdleTimeout:  30 * time.Second,
+	})
+	if err != nil {
+		logInfo("QUIC Dial Error: " + err.Error())
+		return
+	}
+
+	listener, err := net.Listen("tcp", config.LocalListenPort)
+	if err != nil {
+		logInfo("Local Listen Error: " + err.Error())
+		conn.CloseWithError(0, "listen failed")
+		return
+	}
+
+	mu.Lock()
+	activeListener = listener
+	activeSession = quicSessionWrapper{conn}
+	mu.Unlock()
+
+	logInfo("Ready! Listening locally on " + config.LocalListenPort + " for QUIC traffic.")
+	for {
+		localConn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		setKeepAlive(localConn)
+		go func(lconn net.Conn) {
+			defer lconn.Close()
+			stream, err := conn.OpenStreamSync(context.Background())
+			if err != nil {
+				logInfo("QUIC Stream Open Error: " + err.Error())
+				return
+			}
+			defer stream.Close()
+			go relayConnections(stream, lconn)
+			relayConnections(lconn, stream)
+		}(localConn)
+	}
+}
+
 // ---------------- Main & Control ----------------
 
 func main() {
@@ -657,7 +662,7 @@ func main() {
 			case "wss": go startWssDataForwarder(configData.Port)
 			case "wssmux": go startWssMuxDataForwarder(configData.Port)
 			case "utcpmux": go startUtcpMuxDataForwarder(configData.Port)
-			case "quic": go startQuicDataForwarder(configData.Port) // Added QUIC trigger
+			case "quic": go startQuicDataForwarder(configData.Port)
 			}
 		}
 
