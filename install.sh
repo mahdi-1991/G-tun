@@ -14,6 +14,28 @@ fi
 echo "Checking dependencies..."
 apt-get update -y && apt-get install -y git curl wget tar systemd openssl nano
 
+# ================== OS TUNING ==================
+tune_system() {
+    echo "Tuning system for maximum network performance (BBR & Buffers)..."
+    cat <<EOF > /etc/sysctl.d/99-gtun.conf
+fs.file-max = 1048576
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 65536
+net.core.wmem_default = 65536
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    sysctl --system > /dev/null 2>&1
+    echo "System tuned successfully!"
+}
+tune_system
+# ===============================================
+
 # 1. Install Go 1.23.0 safely
 if [ ! -f "/usr/local/go/bin/go" ] || ! /usr/local/go/bin/go version | grep -q "go1.23"; then
     echo "Installing Go 1.23.0..."
@@ -102,8 +124,8 @@ if [ "$SETUP_TYPE" == "1" ]; then
     "tls_cert_path": "/etc/g-tun/cert.pem",
     "tls_key_path": "/etc/g-tun/key.pem",
     "kcp_config": {
-        "NoDelay": 1, "Interval": 10, "Resend": 2, "NoCongestion": 1,
-        "SndWnd": 1024, "RcvWnd": 1024, "DataShards": 10, "ParityShards": 3
+        "NoDelay": 1, "Interval": 20, "Resend": 2, "NoCongestion": 1,
+        "SndWnd": 4096, "RcvWnd": 4096, "DataShards": 10, "ParityShards": 3
     }
 }
 EOF
@@ -217,8 +239,8 @@ elif [ "$SETUP_TYPE" == "2" ]; then
     "local_listen_port": "0.0.0.0:$LOCAL_PORT",
     "token": "$SECRET_TOKEN",
     "kcp_config": {
-        "NoDelay": 1, "Interval": 10, "Resend": 2, "NoCongestion": 1,
-        "SndWnd": 1024, "RcvWnd": 1024, "DataShards": 10, "ParityShards": 3
+        "NoDelay": 1, "Interval": 20, "Resend": 2, "NoCongestion": 1,
+        "SndWnd": 4096, "RcvWnd": 4096, "DataShards": 10, "ParityShards": 3
     }
 }
 EOF
