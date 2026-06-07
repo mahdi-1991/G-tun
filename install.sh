@@ -150,6 +150,8 @@ ExecStart=/usr/local/bin/g-tun-server
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+Environment="GOGC=400"
+Environment="GOMEMLIMIT=768MiB"
 
 [Install]
 WantedBy=multi-user.target
@@ -265,6 +267,8 @@ ExecStart=/usr/local/bin/g-tun-client
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+Environment="GOGC=400"
+Environment="GOMEMLIMIT=768MiB"
 
 [Install]
 WantedBy=multi-user.target
