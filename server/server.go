@@ -3,7 +3,11 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"encoding/hex"
 	"crypto/subtle"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/hmac"
 	"fmt"
 	"io"
 	"net"
@@ -329,24 +333,50 @@ func main() {
 	listener, err := net.Listen("tcp", "0.0.0.0:"+config.ControlPort)
 	if err != nil { logInfo("Failed to start control port: " + err.Error()); os.Exit(1) }
 	for {
-		conn, err := listener.Accept()
-		if err == nil { go handleControlConnection(conn) }
-	}
+		logInfo("Connecting to control server...")
+		conn, err := net.Dial("tcp", config.ControlServerAddress)
+		if err != nil {
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		reader := bufio.NewReader(conn)
+		
+		challengeStr, err := reader.ReadString('\n')
+		if err != nil { conn.Close(); continue }
+		challenge := []byte(strings.TrimPrefix(strings.TrimSuffix(challengeStr, "\n"), "\r"))
+
+		mac := hmac.New(sha256.New, []byte(config.Token))
+		mac.Write(challenge)
+		responseHex := hex.EncodeToString(mac.Sum(nil))
+
+		conn.Write([]byte(responseHex + "\n"))
+		
+		msgStr, err := reader.ReadString('\n')
 }
 
 func handleControlConnection(conn net.Conn) {
 	defer conn.Close()
-	reader := bufio.NewReader(conn)
 	
-	clientToken, err := reader.ReadString('\n')
+	challenge := make([]byte, 32)
+	rand.Read(challenge)
+	
+	conn.Write(challenge)
+	conn.Write([]byte("\n"))
+
+	reader := bufio.NewReader(conn)
+	clientResponseHex, err := reader.ReadString('\n')
 	if err != nil {
-		logInfo("Error reading token.")
+		logInfo("Error reading client response.")
 		return
 	}
+	clientResponseHex = strings.TrimSpace(clientResponseHex)
 
-	clientToken = strings.TrimSpace(clientToken)
-	
-	if subtle.ConstantTimeCompare([]byte(clientToken), []byte(config.Token)) != 1 {
+	mac := hmac.New(sha256.New, []byte(config.Token))
+	mac.Write(challenge)
+	expectedResponseHex := hex.EncodeToString(mac.Sum(nil))
+
+	if subtle.ConstantTimeCompare([]byte(clientResponseHex), []byte(expectedResponseHex)) != 1 {
 		logInfo("Unauthorized access attempt dropped.")
 		return
 	}

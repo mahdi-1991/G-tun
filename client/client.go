@@ -3,7 +3,12 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/hmac"
 	"encoding/json"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +16,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"bytes"
 
 	"github.com/gorilla/websocket"
 	"github.com/xtaci/kcp-go/v5"
@@ -261,21 +267,56 @@ func startWsMuxDataForwarder(dataPort string) {
 
 func startWssDataForwarder(dataPort string) {
 	listener, err := net.Listen("tcp", config.LocalListenPort)
-	if err != nil { logInfo("Local Listen Error: " + err.Error()); return }
-	mu.Lock(); activeListener = listener; mu.Unlock()
+	if err != nil {
+		logInfo("Local Listen Error: " + err.Error())
+		return
+	}
+	mu.Lock()
+	activeListener = listener
+	mu.Unlock()
+
+	// خواندن گواهی سرور در سمت کلاینت برای جلوگیری از MITM
+	localCertPEM, err := os.ReadFile("cert.pem")
+	if err != nil {
+		logInfo("Error reading cert.pem. MITM protection requires the server certificate.")
+		return
+	}
+
+	block, _ := pem.Decode(localCertPEM)
+	if block == nil {
+		logInfo("Invalid cert.pem format")
+		return
+	}
+	expectedCertDER := block.Bytes
 
 	u := url.URL{Scheme: "wss", Host: config.RemoteServerIP + ":" + dataPort, Path: "/wss"}
-	dialer := websocket.DefaultDialer
-	dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	
+	// تنظیمات امنیتی کلاینت برای پین کردن سرتیفیکیت (Certificate Pinning)
+	dialer := websocket.DefaultDialer
+	dialer.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: true, // رد کردن اعتبارسنجی CA عمومی
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			// مقایسه بایت‌های گواهی سرور با فایل cert.pem محلی
+			if !bytes.Equal(rawCerts[0], expectedCertDER) {
+				return fmt.Errorf("MITM Attack Detected! Server certificate does not match cert.pem")
+			}
+			return nil
+		},
+	}
+
 	logInfo("Ready! Listening locally on " + config.LocalListenPort)
 	for {
 		localConn, err := listener.Accept()
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		go func(lconn net.Conn) {
 			defer lconn.Close()
 			wsConn, _, err := dialer.Dial(u.String(), nil)
-			if err != nil { logInfo("WSS Dial Error: " + err.Error()); return }
+			if err != nil {
+				logInfo("WSS Dial Error: " + err.Error())
+				return
+			}
 			defer wsConn.Close()
 			relayWs(lconn, wsConn)
 		}(localConn)
@@ -283,22 +324,62 @@ func startWssDataForwarder(dataPort string) {
 }
 
 func startWssMuxDataForwarder(dataPort string) {
+	localCertPEM, err := os.ReadFile("cert.pem")
+	if err != nil {
+		logInfo("Error reading cert.pem. MITM protection requires the server certificate.")
+		return
+	}
+
+	block, _ := pem.Decode(localCertPEM)
+	if block == nil {
+		logInfo("Invalid cert.pem format")
+		return
+	}
+	expectedCertDER := block.Bytes
+
 	u := url.URL{Scheme: "wss", Host: config.RemoteServerIP + ":" + dataPort, Path: "/wssmux"}
-	dialer := websocket.DefaultDialer
-	dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	ws, _, err := dialer.Dial(u.String(), nil)
-	if err != nil { logInfo("WSS Dial Error: " + err.Error()); return }
-	session, err := smux.Client(&wsConnWrapper{Conn: ws}, nil)
-	if err != nil { logInfo("Smux Client Error: " + err.Error()); return }
 	
+	dialer := websocket.DefaultDialer
+	dialer.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: true, // رد کردن اعتبارسنجی CA عمومی
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if !bytes.Equal(rawCerts[0], expectedCertDER) {
+				return fmt.Errorf("MITM Attack Detected! Server certificate does not match cert.pem")
+			}
+			return nil
+		},
+	}
+
+	ws, _, err := dialer.Dial(u.String(), nil)
+	if err != nil {
+		logInfo("WSS Dial Error: " + err.Error())
+		return
+	}
+	
+	session, err := smux.Client(&wsConnWrapper{Conn: ws}, nil)
+	if err != nil {
+		logInfo("Smux Client Error: " + err.Error())
+		return
+	}
+
 	listener, err := net.Listen("tcp", config.LocalListenPort)
-	if err != nil { logInfo("Local Listen Error: " + err.Error()); session.Close(); return }
-	mu.Lock(); activeListener = listener; activeSession = session; mu.Unlock()
+	if err != nil {
+		logInfo("Local Listen Error: " + err.Error())
+		session.Close()
+		return
+	}
+	
+	mu.Lock()
+	activeListener = listener
+	activeSession = session
+	mu.Unlock()
 
 	logInfo("Ready! Listening locally on " + config.LocalListenPort)
 	for {
 		localConn, err := listener.Accept()
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		go handleLocalMuxConnection(localConn, session)
 	}
 }
