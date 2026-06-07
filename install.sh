@@ -132,7 +132,8 @@ EOF
     echo "Building Server Binary..."
     cd /root/G-tun-Project/server
     
-    /usr/local/go/bin/go get github.com/quic-go/quic-go
+    # قفل کردن نسخه روی ورژن سازگار و پایدار
+    /usr/local/go/bin/go get github.com/quic-go/quic-go@v0.42.0
     /usr/local/go/bin/go mod tidy
     /usr/local/go/bin/go build -o g-tun-server server.go
     mv g-tun-server /usr/local/bin/
@@ -237,7 +238,8 @@ EOF
     echo "Building Client Binary..."
     cd /root/G-tun-Project/client
     
-    /usr/local/go/bin/go get github.com/quic-go/quic-go
+    # قفل کردن نسخه روی ورژن سازگار و پایدار
+    /usr/local/go/bin/go get github.com/quic-go/quic-go@v0.42.0
     /usr/local/go/bin/go mod tidy
     /usr/local/go/bin/go build -o g-tun-client client.go
     mv g-tun-client /usr/local/bin/
