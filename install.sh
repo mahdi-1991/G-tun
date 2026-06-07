@@ -40,6 +40,8 @@ read -p "Enter choice [1 or 2]: " SETUP_TYPE
 read -p "Enter Control Port (default 8080): " CONTROL_PORT
 CONTROL_PORT=${CONTROL_PORT:-8080}
 
+mkdir -p /etc/g-tun
+
 if [ "$SETUP_TYPE" == "1" ]; then
     # ================== SERVER SETUP ==================
     echo "------------------------------------------"
@@ -65,14 +67,31 @@ if [ "$SETUP_TYPE" == "1" ]; then
     read -p "Enter Data Port for Tunnel (default 8081): " DATA_PORT
     DATA_PORT=${DATA_PORT:-8081}
 
-    echo "Generating secure 64-character token..."
-    if command -v openssl >/dev/null 2>&1; then
-        SECRET_TOKEN=$(openssl rand -hex 32)
-    else
-        SECRET_TOKEN=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64)
+    # Preserve token if updating
+    if [ -f /etc/g-tun/server_config.json ]; then
+        SECRET_TOKEN=$(cat /etc/g-tun/server_config.json | grep '"token"' | cut -d '"' -f 4)
     fi
 
-    mkdir -p /etc/g-tun
+    if [ -z "$SECRET_TOKEN" ]; then
+        echo "Generating secure 64-character token..."
+        if command -v openssl >/dev/null 2>&1; then
+            SECRET_TOKEN=$(openssl rand -hex 32)
+        else
+            SECRET_TOKEN=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64)
+        fi
+    fi
+
+    echo "Checking TLS Certificates..."
+    if [ ! -s /etc/g-tun/cert.pem ] || [ ! -s /etc/g-tun/key.pem ]; then
+        echo "Generating new ECC Certificates for WSS..."
+        cd /root/G-tun-Project/server
+        /usr/local/go/bin/go run generate_cert.go
+        cp cert.pem /etc/g-tun/cert.pem
+        cp key.pem /etc/g-tun/key.pem
+    else
+        echo "Found existing certificates in /etc/g-tun/. Keeping them to prevent client disconnections."
+    fi
+
     cat <<EOF > /etc/g-tun/server_config.json
 {
     "control_port": "$CONTROL_PORT",
@@ -80,8 +99,8 @@ if [ "$SETUP_TYPE" == "1" ]; then
     "protocol": "$PROTOCOL",
     "xray_inbound_address": "$XRAY_ADDR",
     "token": "$SECRET_TOKEN",
-    "tls_cert_path": "server.crt",
-    "tls_key_path": "server.key",
+    "tls_cert_path": "/etc/g-tun/cert.pem",
+    "tls_key_path": "/etc/g-tun/key.pem",
     "kcp_config": {
         "NoDelay": 1, "Interval": 10, "Resend": 2, "NoCongestion": 1,
         "SndWnd": 1024, "RcvWnd": 1024, "DataShards": 10, "ParityShards": 3
@@ -90,7 +109,7 @@ if [ "$SETUP_TYPE" == "1" ]; then
 EOF
 
     echo "Building Server Binary..."
-    cd server
+    cd /root/G-tun-Project/server
     
     /usr/local/go/bin/go mod tidy
     /usr/local/go/bin/go build -o g-tun-server server.go
@@ -131,6 +150,12 @@ EOF
     echo " "
     echo " TOKEN: $SECRET_TOKEN"
     echo " "
+    echo " ------------------------------------------------------------------------ "
+    echo " IMPORTANT: Copy the Certificate below (including BEGIN and END lines)    "
+    echo " You MUST paste this during the Client installation!                      "
+    echo " "
+    cat /etc/g-tun/cert.pem
+    echo " "
     echo " You can manage the tunnel anytime by typing: g-tun"
     echo "=========================================================================="
     echo " "
@@ -149,14 +174,41 @@ elif [ "$SETUP_TYPE" == "2" ]; then
     read -p "Enter Local Port to Listen on (default 1080): " LOCAL_PORT
     LOCAL_PORT=${LOCAL_PORT:-1080}
 
+    # Preserve token if updating
+    if [ -f /etc/g-tun/client_config.json ]; then
+        EXISTING_TOKEN=$(cat /etc/g-tun/client_config.json | grep '"token"' | cut -d '"' -f 4)
+    fi
+
     echo "------------------------------------------"
-    read -p "Paste the 64-character Token from Server: " SECRET_TOKEN
+    if [ -n "$EXISTING_TOKEN" ]; then
+        read -p "Paste the 64-character Token from Server (Press Enter to keep existing): " SECRET_TOKEN
+        SECRET_TOKEN=${SECRET_TOKEN:-$EXISTING_TOKEN}
+    else
+        read -p "Paste the 64-character Token from Server: " SECRET_TOKEN
+    fi
+
     if [ -z "$SECRET_TOKEN" ] || [ ${#SECRET_TOKEN} -lt 32 ]; then
         echo "Error: Invalid token. Token must be provided and securely long."
         exit 1
     fi
 
-    mkdir -p /etc/g-tun
+    if [ ! -s /etc/g-tun/cert.pem ]; then
+        echo "------------------------------------------"
+        echo "MITM Protection requires the Server's Certificate (cert.pem)."
+        echo "Press ENTER to open the editor. Paste the certificate you copied from the server,"
+        echo "then press Ctrl+O, Enter, and Ctrl+X to save and exit."
+        read -p "Press ENTER to continue..."
+        nano /etc/g-tun/cert.pem
+        
+        if [ ! -s /etc/g-tun/cert.pem ]; then
+            echo "Warning: Certificate is empty! WSS/WSSMUX protocols will fail to connect."
+        fi
+    else
+        echo "------------------------------------------"
+        echo "Found existing cert.pem in /etc/g-tun/. Skipping certificate prompt."
+        echo "If you changed the server certificate, please delete /etc/g-tun/cert.pem and run this again."
+    fi
+
     cat <<EOF > /etc/g-tun/client_config.json
 {
     "control_server_address": "$SERVER_IP:$CONTROL_PORT",
@@ -172,7 +224,7 @@ elif [ "$SETUP_TYPE" == "2" ]; then
 EOF
 
     echo "Building Client Binary..."
-    cd client
+    cd /root/G-tun-Project/client
     
     /usr/local/go/bin/go mod tidy
     /usr/local/go/bin/go build -o g-tun-client client.go
