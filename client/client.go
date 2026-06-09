@@ -564,9 +564,8 @@ func startQuicDataForwarder(dataPort string) {
 	}
 
 	conn, err := quic.DialAddr(context.Background(), config.RemoteServerIP+":"+dataPort, tlsConf, &quic.Config{
-		KeepAlivePeriod:    10 * time.Second,
-		MaxIdleTimeout:     5 * time.Minute,
-		MaxIncomingStreams: 10000,
+		KeepAlivePeriod: 15 * time.Second,
+		MaxIdleTimeout:  30 * time.Second,
 	})
 	if err != nil {
 		logInfo("QUIC Dial Error: " + err.Error())
@@ -596,9 +595,7 @@ func startQuicDataForwarder(dataPort string) {
 			defer lconn.Close()
 			stream, err := conn.OpenStreamSync(context.Background())
 			if err != nil {
-				if !strings.Contains(err.Error(), "closed by gtun") {
-					logInfo("QUIC Stream Open Error: " + err.Error())
-				}
+				logInfo("QUIC Stream Open Error: " + err.Error())
 				return
 			}
 			defer stream.Close()
