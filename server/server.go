@@ -100,6 +100,8 @@ func loadServerConfiguration() {
 	json.NewDecoder(file).Decode(&config)
 }
 
+// ---------------- Helper Functions ----------------
+
 func getSmuxConfig() *smux.Config {
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.KeepAliveInterval = 10 * time.Second
@@ -116,6 +118,8 @@ func setKeepAlive(conn net.Conn) {
 		tcpConn.SetKeepAlivePeriod(15 * time.Second)
 	}
 }
+
+// ---------------- Data Transport Functions ----------------
 
 func relayConnections(dst io.Writer, src io.Reader) {
 	bufPtr := bufferPool.Get().(*[]byte)
@@ -203,63 +207,6 @@ func startUdpDataListener() {
 	}
 }
 
-func handleMuxStream(stream io.ReadWriteCloser) {
-	defer stream.Close()
-	xrayConn, err := net.Dial("tcp", config.XrayInboundAddress)
-	if err != nil {
-		logInfo("Failed to dial Xray: " + err.Error())
-		return
-	}
-	defer xrayConn.Close()
-	setKeepAlive(xrayConn)
-
-	go relayConnections(xrayConn, stream)
-	relayConnections(stream, xrayConn)
-}
-
-func startQuicDataListener() {
-	cert, err := tls.LoadX509KeyPair(config.TlsCertPath, config.TlsKeyPath)
-	if err != nil {
-		logInfo("QUIC TLS Load Error: " + err.Error())
-		return
-	}
-
-	tlsConf := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"gtun-quic"},
-	}
-
-	quicConfig := &quic.Config{
-		KeepAlivePeriod:    10 * time.Second,
-		MaxIdleTimeout:     5 * time.Minute,
-		MaxIncomingStreams: 10000,
-	}
-
-	listener, err := quic.ListenAddr("0.0.0.0:"+config.DataPort, tlsConf, quicConfig)
-	if err != nil {
-		logInfo("QUIC Listen Error: " + err.Error())
-		return
-	}
-	logInfo("QUIC (HTTP/3) Listener started on port " + config.DataPort)
-
-	for {
-		conn, err := listener.Accept(context.Background())
-		if err != nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		go func(c quic.Connection) {
-			for {
-				stream, err := c.AcceptStream(context.Background())
-				if err != nil {
-					break
-				}
-				go handleMuxStream(stream)
-			}
-		}(conn)
-	}
-}
-
 var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 	ReadBufferSize:  4096,
@@ -324,6 +271,63 @@ func startWsDataListener() {
 	server := &http.Server{Addr: "0.0.0.0:" + config.DataPort, Handler: mux}
 	logInfo("WS Listener started on port " + config.DataPort)
 	server.ListenAndServe()
+}
+
+func handleMuxStream(stream io.ReadWriteCloser) {
+	defer stream.Close()
+	xrayConn, err := net.Dial("tcp", config.XrayInboundAddress)
+	if err != nil {
+		logInfo("Failed to dial Xray: " + err.Error())
+		return
+	}
+	defer xrayConn.Close()
+	setKeepAlive(xrayConn)
+
+	go relayConnections(xrayConn, stream)
+	relayConnections(stream, xrayConn)
+}
+
+func startQuicDataListener() {
+	cert, err := tls.LoadX509KeyPair(config.TlsCertPath, config.TlsKeyPath)
+	if err != nil {
+		logInfo("QUIC TLS Load Error: " + err.Error())
+		return
+	}
+
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"gtun-quic"},
+	}
+
+	quicConfig := &quic.Config{
+		KeepAlivePeriod:    10 * time.Second,
+		MaxIdleTimeout:     5 * time.Minute,
+		MaxIncomingStreams: 10000,
+	}
+
+	listener, err := quic.ListenAddr("0.0.0.0:"+config.DataPort, tlsConf, quicConfig)
+	if err != nil {
+		logInfo("QUIC Listen Error: " + err.Error())
+		return
+	}
+	logInfo("QUIC (HTTP/3) Listener started on port " + config.DataPort)
+
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		go func(c quic.Connection) {
+			for {
+				stream, err := c.AcceptStream(context.Background())
+				if err != nil {
+					break
+				}
+				go handleMuxStream(stream)
+			}
+		}(conn)
+	}
 }
 
 func startTcpMuxDataListener() {
@@ -448,6 +452,8 @@ func startUtcpMuxDataListener() {
 	}
 }
 
+// ---------------- Main & Control ----------------
+
 func main() {
 	loadServerConfiguration()
 	logInfo("Server starting control listener on port " + config.ControlPort)
@@ -455,13 +461,13 @@ func main() {
 	switch config.Protocol {
 	case "tcp": go startTcpDataListener()
 	case "udp": go startUdpDataListener()
-	case "ws": go startWsDataListener()
+	case "ws": go startWsDataListener() // Assuming your existing WS functions are here
 	case "tcpmux": go startTcpMuxDataListener()
-	case "wsmux": go startWsMuxDataListener()
-	case "wss": go startWssDataListener()
-	case "wssmux": go startWssMuxDataListener()
+	case "wsmux": go startWsMuxDataListener() // Assuming your existing WSMUX functions are here
+	case "wss": go startWssDataListener() // Assuming your existing WSS functions are here
+	case "wssmux": go startWssMuxDataListener() // Assuming your existing WSSMUX functions are here
 	case "utcpmux": go startUtcpMuxDataListener()
-	case "quic": go startQuicDataListener()
+	case "quic": go startQuicDataListener() // Added QUIC trigger
 	}
 
 	listener, err := net.Listen("tcp", "0.0.0.0:"+config.ControlPort)
@@ -472,7 +478,6 @@ func main() {
 	for {
 		conn, err := listener.Accept()
 		if err == nil {
-			setKeepAlive(conn) // جلوگیری از زامبی شدن کانکشن کنترل
 			go handleControlConnection(conn)
 		}
 	}
@@ -481,15 +486,12 @@ func main() {
 func handleControlConnection(conn net.Conn) {
 	defer conn.Close()
 
-	// 1. تولید چالش و تبدیل آن به متن (Hex) برای جلوگیری از حساسیت فایروال به دیتای باینری
 	challenge := make([]byte, 32)
 	rand.Read(challenge)
-	challengeHex := hex.EncodeToString(challenge)
 
-	// 2. ارسال چالش به صورت متن
-	conn.Write([]byte(challengeHex + "\n"))
+	conn.Write(challenge)
+	conn.Write([]byte("\n"))
 
-	// 3. دریافت پاسخ از کلاینت
 	reader := bufio.NewReader(conn)
 	clientResponseHex, err := reader.ReadString('\n')
 	if err != nil {
@@ -498,9 +500,8 @@ func handleControlConnection(conn net.Conn) {
 	}
 	clientResponseHex = strings.TrimSpace(clientResponseHex)
 
-	// 4. محاسبه هش بر اساس چالش متنی (Hex)
 	mac := hmac.New(sha256.New, []byte(config.Token))
-	mac.Write([]byte(challengeHex))
+	mac.Write(challenge)
 	expectedResponseHex := hex.EncodeToString(mac.Sum(nil))
 
 	if subtle.ConstantTimeCompare([]byte(clientResponseHex), []byte(expectedResponseHex)) != 1 {
