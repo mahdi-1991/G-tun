@@ -28,18 +28,20 @@ fi
 update_gtun() {
     echo -e "${YELLOW}Updating G-Tun from GitHub...${NC}"
     cd /root/G-tun-Project
-    git pull origin main || echo -e "${RED}Failed to pull from GitHub.${NC}"
+    git pull origin main || { echo -e "${RED}Failed to pull from GitHub.${NC}"; sleep 2; show_menu; return; }
     
     echo -e "${YELLOW}Rebuilding binaries...${NC}"
     if [ "$ROLE" == "Server" ]; then
         cd server
+        /usr/local/go/bin/go get github.com/quic-go/quic-go@v0.48.2
         /usr/local/go/bin/go mod tidy
-        /usr/local/go/bin/go build -o g-tun-server server.go
+        /usr/local/go/bin/go build -o g-tun-server server.go || { echo -e "${RED}Build failed!${NC}"; sleep 2; show_menu; return; }
         mv g-tun-server /usr/local/bin/
     else
         cd client
+        /usr/local/go/bin/go get github.com/quic-go/quic-go@v0.48.2
         /usr/local/go/bin/go mod tidy
-        /usr/local/go/bin/go build -o g-tun-client client.go
+        /usr/local/go/bin/go build -o g-tun-client client.go || { echo -e "${RED}Build failed!${NC}"; sleep 2; show_menu; return; }
         mv g-tun-client /usr/local/bin/
     fi
     

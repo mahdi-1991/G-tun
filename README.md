@@ -44,3 +44,37 @@ This script works for both the **Foreign Server** and the **Client**.
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/mahdi-1991/G-tun/main/install.sh)
+```
+
+---
+
+## 🔄 Update to Latest Version
+
+Already have G-Tun installed? Update without reinstalling:
+
+```bash
+g-tun
+# Select option 8) Update G-Tun to Latest Version
+```
+
+The update process:
+- ✅ Pulls latest code from GitHub
+- ✅ Updates dependencies automatically  
+- ✅ Rebuilds the binary
+- ✅ Restarts the service
+- ✅ **No configuration loss**
+- ✅ **No downtime** (auto-restart)
+
+---
+
+## 🐛 Recent Bug Fixes (Latest Update)
+
+This version includes critical bug fixes:
+
+- 🔴 **Fixed QUIC Build Error**: Added missing `quic-go` dependency
+- 🔴 **Fixed UDP Memory Leak**: Sessions now auto-cleanup after 3 minutes idle
+- 🔴 **Fixed Client Reconnect Flood**: Added exponential backoff (3s → 60s)
+- 🟡 **Improved Session Management**: Multiplexed protocols now properly close old sessions
+- 🟡 **Added Auth Timeout**: Control channel now has 10s timeout to prevent hanging
+
+See [CHANGELOG.md](CHANGELOG.md) for full details

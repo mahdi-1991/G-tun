@@ -1,0 +1,23 @@
+🐛 Critical Bug Fixes & Performance Improvements
+
+## 🔴 Critical Fixes
+- Add missing quic-go dependency (v0.48.2) to both server & client
+- Fix UDP session memory leak with auto-cleanup (3min idle timeout)
+- Fix client reconnect flood with exponential backoff (3s → 60s cap)
+
+## 🟡 Improvements  
+- Fix smux session resource leak in multiplexed protocols
+- Add 10s auth timeout to prevent hanging control connections
+- Better error handling & logging across all protocols
+
+## 📦 Changes
+- Update quic-go from v0.42.0 → v0.48.2
+- Improve wsConnWrapper EOF handling
+- Add comprehensive code comments (Persian)
+
+## 🚀 Deployment
+- Update install.sh & g-tun.sh for new dependencies
+- No config changes needed - just run option 8 to update
+- Zero downtime update process
+
+See CHANGELOG.md for full details.

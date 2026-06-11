@@ -1,0 +1,44 @@
+# Binaries
+g-tun-server
+g-tun-client
+*.exe
+
+# Go build artifacts
+*.o
+*.a
+*.so
+
+# Go test coverage
+*.out
+coverage.txt
+
+# Certificates (should be generated per deployment)
+cert.pem
+key.pem
+*.crt
+*.key
+
+# Config files with secrets
+*_config.json
+
+# Go vendor
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compressed files
+*.tar.gz
+*.zip
+go*.linux-amd64.tar.gz
+
+# Logs
+*.log
