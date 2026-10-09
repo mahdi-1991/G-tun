@@ -11,8 +11,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -26,17 +28,22 @@ import (
 	"github.com/xtaci/smux"
 )
 
+const (
+	UDPIdleTimeout = 3 * time.Minute
+	MaxUDPSize     = 65536
+)
+
 // ==================== Config Structs ====================
 
 type KcpConfig struct {
-	NoDelay      int
-	Interval     int
-	Resend       int
-	NoCongestion int
-	SndWnd       int
-	RcvWnd       int
-	DataShards   int
-	ParityShards int
+	NoDelay      int `json:"NoDelay"`
+	Interval     int `json:"Interval"`
+	Resend       int `json:"Resend"`
+	NoCongestion int `json:"NoCongestion"`
+	SndWnd       int `json:"SndWnd"`
+	RcvWnd       int `json:"RcvWnd"`
+	DataShards   int `json:"DataShards"`
+	ParityShards int `json:"ParityShards"`
 }
 
 type ClientConfig struct {
@@ -48,15 +55,6 @@ type ClientConfig struct {
 	KcpConfig            KcpConfig `json:"kcp_config"`
 }
 
-var (
-	config         ClientConfig
-	bufferPool     = sync.Pool{New: func() interface{} { b := make([]byte, 64*1024); return &b }}
-	activeListener io.Closer
-	mu             sync.Mutex
-)
-
-// ==================== Message Structs ====================
-
 type Message struct {
 	Command string `json:"command"`
 	Payload string `json:"payload"`
@@ -67,84 +65,74 @@ type TransportConfig struct {
 	Port     string `json:"port"`
 }
 
-// ==================== WebSocket Wrapper ====================
+// ==================== Utils & Wrappers ====================
 
-// wsConnWrapper: تبدیل websocket.Conn به net.Conn-like برای استفاده با smux
-type wsConnWrapper struct {
-	*websocket.Conn
-	r io.Reader
+var bufferPool = sync.Pool{
+	New: func() any { b := make([]byte, 64*1024); return &b },
 }
 
-func (c *wsConnWrapper) Read(b []byte) (int, error) {
+// relayConnections safely copies data bidirectionally and ensures both connections close on exit.
+func relayConnections(conn1, conn2 io.ReadWriteCloser) {
+	defer conn1.Close()
+	defer conn2.Close()
+	errChan := make(chan error, 2)
+
+	copyFunc := func(dst io.Writer, src io.Reader) {
+		bufPtr := bufferPool.Get().(*[]byte)
+		defer bufferPool.Put(bufPtr)
+		_, err := io.CopyBuffer(dst, src, *bufPtr)
+		errChan <- err
+	}
+
+	go copyFunc(conn1, conn2)
+	go copyFunc(conn2, conn1)
+	<-errChan // Block until one side errors or closes
+}
+
+type wsConnWrapper struct {
+	*websocket.Conn
+	reader io.Reader
+}
+
+func (w *wsConnWrapper) Read(b []byte) (int, error) {
 	for {
-		if c.r != nil {
-			n, err := c.r.Read(b)
-			if err == io.EOF {
-				// فریم فعلی تموم شد، فریم بعدی رو بگیر
-				c.r = nil
+		if w.reader == nil {
+			msgType, r, err := w.NextReader()
+			if err != nil {
+				return 0, err
+			}
+			if msgType != websocket.BinaryMessage {
 				continue
 			}
-			return n, err
+			w.reader = r
 		}
-		_, r, err := c.NextReader()
-		if err != nil {
-			return 0, err
+		n, err := w.reader.Read(b)
+		if err == io.EOF {
+			w.reader = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
 		}
-		c.r = r
+		return n, err
 	}
 }
 
-func (c *wsConnWrapper) Write(b []byte) (int, error) {
-	err := c.WriteMessage(websocket.BinaryMessage, b)
-	if err != nil {
+func (w *wsConnWrapper) Write(b []byte) (int, error) {
+	if err := w.WriteMessage(websocket.BinaryMessage, b); err != nil {
 		return 0, err
 	}
 	return len(b), nil
 }
 
-// ==================== Helpers ====================
-
-func logInfo(message string) {
-	fmt.Printf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), message)
-}
-
-func loadClientConfiguration() {
-	file, err := os.Open("client_config.json")
-	if err != nil {
-		fmt.Println("Error loading client_config.json:", err)
-		os.Exit(1)
-	}
-	defer file.Close()
-	if err := json.NewDecoder(file).Decode(&config); err != nil {
-		fmt.Println("Error parsing client_config.json:", err)
-		os.Exit(1)
-	}
-}
-
-func relayConnections(dst io.Writer, src io.Reader) {
-	bufPtr := bufferPool.Get().(*[]byte)
-	defer bufferPool.Put(bufPtr)
-	io.CopyBuffer(dst, src, *bufPtr)
-}
-
-// stopTransport: listener فعلی رو می‌بنده تا transport قدیمی متوقف بشه
-func stopTransport() {
-	mu.Lock()
-	defer mu.Unlock()
-	if activeListener != nil {
-		activeListener.Close()
-		activeListener = nil
-	}
-}
-
 func getSmuxConfig() *smux.Config {
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.KeepAliveInterval = 10 * time.Second
-	smuxConfig.KeepAliveTimeout = 30 * time.Second
-	smuxConfig.MaxFrameSize = 32 * 1024
-	smuxConfig.MaxReceiveBuffer = 4194304
-	smuxConfig.MaxStreamBuffer = 65536
-	return smuxConfig
+	conf := smux.DefaultConfig()
+	conf.KeepAliveInterval = 10 * time.Second
+	conf.KeepAliveTimeout = 30 * time.Second
+	conf.MaxFrameSize = 32 * 1024
+	conf.MaxReceiveBuffer = 4194304
+	conf.MaxStreamBuffer = 65536
+	return conf
 }
 
 func setKeepAlive(conn net.Conn) {
@@ -154,113 +142,159 @@ func setKeepAlive(conn net.Conn) {
 	}
 }
 
-// loadPinnedCert: خواندن cert.pem و استخراج DER bytes برای certificate pinning
 func loadPinnedCert() ([]byte, error) {
 	localCertPEM, err := os.ReadFile("cert.pem")
 	if err != nil {
-		return nil, fmt.Errorf("error reading cert.pem: %w", err)
+		return nil, fmt.Errorf("reading cert.pem: %w", err)
 	}
 	block, _ := pem.Decode(localCertPEM)
 	if block == nil {
-		return nil, fmt.Errorf("failed to decode cert.pem")
+		return nil, errors.New("failed to decode cert.pem")
 	}
 	return block.Bytes, nil
 }
 
-// makePinnedTLSConfig: ساخت tls.Config با certificate pinning برای جلوگیری از MITM
 func makePinnedTLSConfig(expectedCertDER []byte, nextProtos []string) *tls.Config {
 	return &tls.Config{
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: true, // Verification handled below
 		NextProtos:         nextProtos,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 || !bytes.Equal(rawCerts[0], expectedCertDER) {
-				return fmt.Errorf("certificate mismatch: possible MITM attack")
+				return errors.New("certificate mismatch: possible MITM attack")
 			}
 			return nil
 		},
 	}
 }
 
-// ==================== Standard Protocols ====================
+// ==================== Client Core ====================
 
-func startTcpDataForwarder(dataPort string) {
-	listener, err := net.Listen("tcp", config.LocalListenPort)
+type TunnelClient struct {
+	config         ClientConfig
+	activeListener io.Closer
+	mu             sync.Mutex
+}
+
+func NewTunnelClient(cfg ClientConfig) *TunnelClient {
+	return &TunnelClient{config: cfg}
+}
+
+func (c *TunnelClient) stopTransport() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.activeListener != nil {
+		c.activeListener.Close()
+		c.activeListener = nil
+	}
+}
+
+func (c *TunnelClient) setListener(l io.Closer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.activeListener = l
+}
+
+func (c *TunnelClient) startForwarder(proto, port string) {
+	c.stopTransport()
+	slog.Info("Starting protocol", "protocol", proto, "port", port)
+
+	switch proto {
+	case "tcp":
+		go c.forwardTCP(port)
+	case "udp":
+		go c.forwardUDP(port)
+	case "ws":
+		go c.forwardWS(port)
+	case "wss":
+		go c.forwardWSS(port)
+	case "tcpmux":
+		go c.forwardTCPMux(port)
+	case "wsmux":
+		go c.forwardWSMux(port)
+	case "wssmux":
+		go c.forwardWSSMux(port)
+	case "utcpmux":
+		go c.forwardKCPMux(port)
+	case "quic":
+		go c.forwardQUIC(port)
+	default:
+		slog.Warn("Unknown protocol received", "protocol", proto)
+	}
+}
+
+// forwardTCP implements standard TCP forwarding.
+func (c *TunnelClient) forwardTCP(dataPort string) {
+	listener, err := net.Listen("tcp", c.config.LocalListenPort)
 	if err != nil {
-		logInfo("TCP local listen error: " + err.Error())
+		slog.Error("TCP local listen error", "err", err)
 		return
 	}
-	mu.Lock()
-	activeListener = listener
-	mu.Unlock()
+	c.setListener(listener)
+	slog.Info("Listening locally", "addr", c.config.LocalListenPort)
 
-	logInfo("Ready! Listening locally on " + config.LocalListenPort)
-	remoteDataAddr := config.RemoteServerIP + ":" + dataPort
-
+	remoteDataAddr := net.JoinHostPort(c.config.RemoteServerIP, dataPort)
 	for {
 		localConn, err := listener.Accept()
 		if err != nil {
 			return
 		}
 		setKeepAlive(localConn)
+
 		go func(lconn net.Conn) {
-			defer lconn.Close()
 			rconn, err := net.Dial("tcp", remoteDataAddr)
 			if err != nil {
-				logInfo("TCP dial error: " + err.Error())
+				slog.Error("TCP dial error", "err", err)
+				lconn.Close()
 				return
 			}
-			defer rconn.Close()
 			setKeepAlive(rconn)
-			go relayConnections(rconn, lconn)
 			relayConnections(lconn, rconn)
 		}(localConn)
 	}
 }
 
-// udpClientSession: session سمت کلاینت برای هر UDP peer
-type udpClientSession struct {
-	conn     *net.UDPConn
-	lastSeen time.Time
-}
-
-// startUdpDataForwarder: UDP forwarding با idle session cleanup
-// FIX: اضافه شدن goroutine پاک‌سازی برای جلوگیری از session leak
-func startUdpDataForwarder(dataPort string) {
-	localAddr, _ := net.ResolveUDPAddr("udp", config.LocalListenPort)
-	localConn, err := net.ListenUDP("udp", localAddr)
+// forwardUDP handles UDP forwarding with proper session cleanup.
+func (c *TunnelClient) forwardUDP(dataPort string) {
+	localAddr, err := net.ResolveUDPAddr("udp", c.config.LocalListenPort)
 	if err != nil {
-		logInfo("UDP local listen error: " + err.Error())
+		slog.Error("Resolve UDP error", "err", err)
 		return
 	}
-	mu.Lock()
-	activeListener = localConn
-	mu.Unlock()
+	localConn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		slog.Error("UDP local listen error", "err", err)
+		return
+	}
+	c.setListener(localConn)
+	slog.Info("Listening locally (UDP)", "addr", c.config.LocalListenPort)
 
-	logInfo("Ready! Listening locally on " + config.LocalListenPort)
-	remoteDataAddr := config.RemoteServerIP + ":" + dataPort
-
-	sessions := make(map[string]*udpClientSession)
+	remoteDataAddr := net.JoinHostPort(c.config.RemoteServerIP, dataPort)
+	type udpSession struct {
+		conn     *net.UDPConn
+		lastSeen time.Time
+	}
+	sessions := make(map[string]*udpSession)
 	var mapMutex sync.Mutex
 
-	// goroutine پاک‌سازی session های idle
+	// Cleanup Routine
 	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
+		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			now := time.Now()
 			mapMutex.Lock()
+			now := time.Now()
 			for addr, sess := range sessions {
-				if now.Sub(sess.lastSeen) > 3*time.Minute {
+				if now.Sub(sess.lastSeen) > UDPIdleTimeout {
 					sess.conn.Close()
 					delete(sessions, addr)
-					logInfo("UDP client session expired for " + addr)
+					slog.Debug("UDP session expired", "client", addr)
 				}
 			}
 			mapMutex.Unlock()
 		}
 	}()
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, MaxUDPSize)
 	for {
 		n, clientAddr, err := localConn.ReadFromUDP(buf)
 		if err != nil {
@@ -273,14 +307,14 @@ func startUdpDataForwarder(dataPort string) {
 			udpServerAddr, _ := net.ResolveUDPAddr("udp", remoteDataAddr)
 			remoteConn, err := net.DialUDP("udp", nil, udpServerAddr)
 			if err != nil {
-				logInfo("UDP dial error: " + err.Error())
+				slog.Error("UDP dial error", "err", err)
 				mapMutex.Unlock()
 				continue
 			}
-			sess = &udpClientSession{conn: remoteConn, lastSeen: time.Now()}
+			sess = &udpSession{conn: remoteConn, lastSeen: time.Now()}
 			sessions[clientAddr.String()] = sess
 
-			go func(lconn *net.UDPConn, rconn *net.UDPConn, cAddr *net.UDPAddr, addrStr string) {
+			go func(rconn *net.UDPConn, cAddr *net.UDPAddr, addrStr string) {
 				remoteBufPtr := bufferPool.Get().(*[]byte)
 				defer bufferPool.Put(remoteBufPtr)
 				for {
@@ -292,116 +326,51 @@ func startUdpDataForwarder(dataPort string) {
 						rconn.Close()
 						return
 					}
-					lconn.WriteToUDP((*remoteBufPtr)[:m], cAddr)
+					localConn.WriteToUDP((*remoteBufPtr)[:m], cAddr)
 				}
-			}(localConn, remoteConn, clientAddr, clientAddr.String())
+			}(remoteConn, clientAddr, clientAddr.String())
 		} else {
 			sess.lastSeen = time.Now()
 		}
 		currentConn := sess.conn
 		mapMutex.Unlock()
 
-		currentConn.SetDeadline(time.Now().Add(3 * time.Minute))
+		currentConn.SetDeadline(time.Now().Add(UDPIdleTimeout))
 		currentConn.Write(buf[:n])
 	}
 }
 
-// relayWs: relay داده بین یه TCP conn محلی و یه WebSocket conn
-func relayWs(localConn net.Conn, wsConn *websocket.Conn) {
-	errChan := make(chan error, 2)
-
-	// local → WS
-	go func() {
-		bufPtr := bufferPool.Get().(*[]byte)
-		defer bufferPool.Put(bufPtr)
-		buf := *bufPtr
-		for {
-			n, err := localConn.Read(buf)
-			if err != nil {
-				errChan <- err
-				return
-			}
-			if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				errChan <- err
-				return
-			}
-		}
-	}()
-
-	// WS → local
-	go func() {
-		for {
-			mt, message, err := wsConn.ReadMessage()
-			if err != nil {
-				errChan <- err
-				return
-			}
-			if mt == websocket.BinaryMessage {
-				if _, err := localConn.Write(message); err != nil {
-					errChan <- err
-					return
-				}
-			}
-		}
-	}()
-
-	<-errChan
+// forwardWS handles WebSocket forwarding.
+func (c *TunnelClient) forwardWS(dataPort string) {
+	c.serveWebSocket("ws", dataPort, nil)
 }
 
-func startWsDataForwarder(dataPort string) {
-	listener, err := net.Listen("tcp", config.LocalListenPort)
-	if err != nil {
-		logInfo("WS local listen error: " + err.Error())
-		return
-	}
-	mu.Lock()
-	activeListener = listener
-	mu.Unlock()
-
-	logInfo("Ready! Listening locally on " + config.LocalListenPort)
-	u := url.URL{Scheme: "ws", Host: config.RemoteServerIP + ":" + dataPort, Path: "/ws"}
-
-	for {
-		localConn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		setKeepAlive(localConn)
-		go func(lconn net.Conn) {
-			defer lconn.Close()
-			wsConn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-			if err != nil {
-				logInfo("WS dial error: " + err.Error())
-				return
-			}
-			defer wsConn.Close()
-			relayWs(lconn, wsConn)
-		}(localConn)
-	}
-}
-
-func startWssDataForwarder(dataPort string) {
+// forwardWSS handles Secure WebSocket forwarding.
+func (c *TunnelClient) forwardWSS(dataPort string) {
 	expectedCertDER, err := loadPinnedCert()
 	if err != nil {
-		logInfo("WSS cert error: " + err.Error())
+		slog.Error("WSS cert error", "err", err)
 		return
 	}
-
-	listener, err := net.Listen("tcp", config.LocalListenPort)
-	if err != nil {
-		logInfo("WSS local listen error: " + err.Error())
-		return
-	}
-	mu.Lock()
-	activeListener = listener
-	mu.Unlock()
-
-	u := url.URL{Scheme: "wss", Host: config.RemoteServerIP + ":" + dataPort, Path: "/wss"}
 	dialer := &websocket.Dialer{
 		TLSClientConfig: makePinnedTLSConfig(expectedCertDER, nil),
 	}
+	c.serveWebSocket("wss", dataPort, dialer)
+}
 
-	logInfo("Ready! Listening locally on " + config.LocalListenPort)
+func (c *TunnelClient) serveWebSocket(scheme, port string, dialer *websocket.Dialer) {
+	if dialer == nil {
+		dialer = websocket.DefaultDialer
+	}
+	listener, err := net.Listen("tcp", c.config.LocalListenPort)
+	if err != nil {
+		slog.Error("WS local listen error", "err", err)
+		return
+	}
+	c.setListener(listener)
+	u := url.URL{Scheme: scheme, Host: net.JoinHostPort(c.config.RemoteServerIP, port), Path: "/" + scheme}
+	slog.Info("Listening locally", "addr", c.config.LocalListenPort)
+
 	for {
 		localConn, err := listener.Accept()
 		if err != nil {
@@ -409,51 +378,19 @@ func startWssDataForwarder(dataPort string) {
 		}
 		setKeepAlive(localConn)
 		go func(lconn net.Conn) {
-			defer lconn.Close()
 			wsConn, _, err := dialer.Dial(u.String(), nil)
 			if err != nil {
-				logInfo("WSS dial error: " + err.Error())
+				slog.Error("WS dial error", "err", err)
+				lconn.Close()
 				return
 			}
-			defer wsConn.Close()
-			relayWs(lconn, wsConn)
+			relayConnections(lconn, &wsConnWrapper{Conn: wsConn})
 		}(localConn)
 	}
 }
 
-// ==================== Multiplexed Protocols ====================
-
-// newSmuxSession: ساخت یه smux session جدید روی TCP
-// FIX: session قدیمی بسته می‌شه قبل از ساخت جدید تا resource leak نشه
-func newSmuxSession(remoteAddr string, oldSess *smux.Session) (*smux.Session, error) {
-	if oldSess != nil && !oldSess.IsClosed() {
-		oldSess.Close()
-	}
-	baseConn, err := net.Dial("tcp", remoteAddr)
-	if err != nil {
-		return nil, err
-	}
-	setKeepAlive(baseConn)
-	sess, err := smux.Client(baseConn, getSmuxConfig())
-	if err != nil {
-		baseConn.Close()
-		return nil, err
-	}
-	return sess, nil
-}
-
-func startTcpMuxDataForwarder(dataPort string) {
-	listener, err := net.Listen("tcp", config.LocalListenPort)
-	if err != nil {
-		logInfo("TCPMux local listen error: " + err.Error())
-		return
-	}
-	mu.Lock()
-	activeListener = listener
-	mu.Unlock()
-	logInfo("Ready! Listening locally on " + config.LocalListenPort)
-
-	remoteAddr := config.RemoteServerIP + ":" + dataPort
+// handleMux simplifies smux session management
+func (c *TunnelClient) handleMux(listener net.Listener, dialFunc func() (*smux.Session, error)) {
 	var sess *smux.Session
 	var sessMu sync.Mutex
 
@@ -465,78 +402,15 @@ func startTcpMuxDataForwarder(dataPort string) {
 		setKeepAlive(localConn)
 
 		go func(lconn net.Conn) {
-			defer lconn.Close()
-
 			sessMu.Lock()
 			if sess == nil || sess.IsClosed() {
-				newSess, err := newSmuxSession(remoteAddr, sess)
-				if err != nil {
-					logInfo("TCPMux session error: " + err.Error())
-					sessMu.Unlock()
-					return
-				}
-				sess = newSess
-			}
-			currentSess := sess
-			sessMu.Unlock()
-
-			stream, err := currentSess.OpenStream()
-			if err != nil {
-				// session احتمالاً مرده، دفعه بعد rebuild میشه
-				sessMu.Lock()
-				if sess == currentSess {
-					sess = nil
-				}
-				sessMu.Unlock()
-				return
-			}
-			defer stream.Close()
-			go relayConnections(stream, lconn)
-			relayConnections(lconn, stream)
-		}(localConn)
-	}
-}
-
-func startWsMuxDataForwarder(dataPort string) {
-	u := url.URL{Scheme: "ws", Host: config.RemoteServerIP + ":" + dataPort, Path: "/wsmux"}
-	listener, err := net.Listen("tcp", config.LocalListenPort)
-	if err != nil {
-		logInfo("WSMux local listen error: " + err.Error())
-		return
-	}
-	mu.Lock()
-	activeListener = listener
-	mu.Unlock()
-	logInfo("Ready! Listening locally on " + config.LocalListenPort)
-
-	var sess *smux.Session
-	var sessMu sync.Mutex
-
-	for {
-		localConn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		setKeepAlive(localConn)
-
-		go func(lconn net.Conn) {
-			defer lconn.Close()
-
-			sessMu.Lock()
-			if sess == nil || sess.IsClosed() {
-				// session قدیمی رو ببند
 				if sess != nil {
 					sess.Close()
 				}
-				ws, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+				newSess, err := dialFunc()
 				if err != nil {
-					logInfo("WSMux dial error: " + err.Error())
-					sessMu.Unlock()
-					return
-				}
-				newSess, err := smux.Client(&wsConnWrapper{Conn: ws}, getSmuxConfig())
-				if err != nil {
-					ws.Close()
+					slog.Error("Mux session error", "err", err)
+					lconn.Close()
 					sessMu.Unlock()
 					return
 				}
@@ -547,6 +421,7 @@ func startWsMuxDataForwarder(dataPort string) {
 
 			stream, err := currentSess.OpenStream()
 			if err != nil {
+				lconn.Close()
 				sessMu.Lock()
 				if sess == currentSess {
 					sess = nil
@@ -554,169 +429,112 @@ func startWsMuxDataForwarder(dataPort string) {
 				sessMu.Unlock()
 				return
 			}
-			defer stream.Close()
-			go relayConnections(stream, lconn)
 			relayConnections(lconn, stream)
 		}(localConn)
 	}
 }
 
-func startWssMuxDataForwarder(dataPort string) {
+func (c *TunnelClient) forwardTCPMux(dataPort string) {
+	listener, err := net.Listen("tcp", c.config.LocalListenPort)
+	if err != nil {
+		slog.Error("TCPMux local listen error", "err", err)
+		return
+	}
+	c.setListener(listener)
+	slog.Info("Listening locally (TCPMux)", "addr", c.config.LocalListenPort)
+
+	remoteAddr := net.JoinHostPort(c.config.RemoteServerIP, dataPort)
+	c.handleMux(listener, func() (*smux.Session, error) {
+		baseConn, err := net.Dial("tcp", remoteAddr)
+		if err != nil {
+			return nil, err
+		}
+		setKeepAlive(baseConn)
+		return smux.Client(baseConn, getSmuxConfig())
+	})
+}
+
+func (c *TunnelClient) forwardWSMux(dataPort string) {
+	listener, err := net.Listen("tcp", c.config.LocalListenPort)
+	if err != nil {
+		slog.Error("WSMux local listen error", "err", err)
+		return
+	}
+	c.setListener(listener)
+	slog.Info("Listening locally (WSMux)", "addr", c.config.LocalListenPort)
+
+	u := url.URL{Scheme: "ws", Host: net.JoinHostPort(c.config.RemoteServerIP, dataPort), Path: "/wsmux"}
+	c.handleMux(listener, func() (*smux.Session, error) {
+		ws, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		return smux.Client(&wsConnWrapper{Conn: ws}, getSmuxConfig())
+	})
+}
+
+func (c *TunnelClient) forwardWSSMux(dataPort string) {
 	expectedCertDER, err := loadPinnedCert()
 	if err != nil {
-		logInfo("WSSMux cert error: " + err.Error())
+		slog.Error("WSSMux cert error", "err", err)
 		return
 	}
-
-	u := url.URL{Scheme: "wss", Host: config.RemoteServerIP + ":" + dataPort, Path: "/wssmux"}
-	dialer := &websocket.Dialer{
-		TLSClientConfig: makePinnedTLSConfig(expectedCertDER, nil),
-	}
-
-	listener, err := net.Listen("tcp", config.LocalListenPort)
+	dialer := &websocket.Dialer{TLSClientConfig: makePinnedTLSConfig(expectedCertDER, nil)}
+	listener, err := net.Listen("tcp", c.config.LocalListenPort)
 	if err != nil {
-		logInfo("WSSMux local listen error: " + err.Error())
+		slog.Error("WSSMux local listen error", "err", err)
 		return
 	}
-	mu.Lock()
-	activeListener = listener
-	mu.Unlock()
-	logInfo("Ready! Listening locally on " + config.LocalListenPort)
+	c.setListener(listener)
+	slog.Info("Listening locally (WSSMux)", "addr", c.config.LocalListenPort)
 
-	var sess *smux.Session
-	var sessMu sync.Mutex
-
-	for {
-		localConn, err := listener.Accept()
+	u := url.URL{Scheme: "wss", Host: net.JoinHostPort(c.config.RemoteServerIP, dataPort), Path: "/wssmux"}
+	c.handleMux(listener, func() (*smux.Session, error) {
+		ws, _, err := dialer.Dial(u.String(), nil)
 		if err != nil {
-			return
+			return nil, err
 		}
-		setKeepAlive(localConn)
-
-		go func(lconn net.Conn) {
-			defer lconn.Close()
-
-			sessMu.Lock()
-			if sess == nil || sess.IsClosed() {
-				if sess != nil {
-					sess.Close()
-				}
-				ws, _, err := dialer.Dial(u.String(), nil)
-				if err != nil {
-					logInfo("WSSMux dial error: " + err.Error())
-					sessMu.Unlock()
-					return
-				}
-				newSess, err := smux.Client(&wsConnWrapper{Conn: ws}, getSmuxConfig())
-				if err != nil {
-					ws.Close()
-					sessMu.Unlock()
-					return
-				}
-				sess = newSess
-			}
-			currentSess := sess
-			sessMu.Unlock()
-
-			stream, err := currentSess.OpenStream()
-			if err != nil {
-				sessMu.Lock()
-				if sess == currentSess {
-					sess = nil
-				}
-				sessMu.Unlock()
-				return
-			}
-			defer stream.Close()
-			go relayConnections(stream, lconn)
-			relayConnections(lconn, stream)
-		}(localConn)
-	}
+		return smux.Client(&wsConnWrapper{Conn: ws}, getSmuxConfig())
+	})
 }
 
-func startUtcpMuxDataForwarder(dataPort string) {
-	kcpConf := config.KcpConfig
-	listener, err := net.Listen("tcp", config.LocalListenPort)
+func (c *TunnelClient) forwardKCPMux(dataPort string) {
+	listener, err := net.Listen("tcp", c.config.LocalListenPort)
 	if err != nil {
-		logInfo("UTCPMux local listen error: " + err.Error())
+		slog.Error("KCPMux local listen error", "err", err)
 		return
 	}
-	mu.Lock()
-	activeListener = listener
-	mu.Unlock()
-	logInfo("Ready! Listening locally on " + config.LocalListenPort)
+	c.setListener(listener)
+	slog.Info("Listening locally (KCPMux)", "addr", c.config.LocalListenPort)
 
-	var sess *smux.Session
-	var sessMu sync.Mutex
-
-	for {
-		localConn, err := listener.Accept()
+	remoteAddr := net.JoinHostPort(c.config.RemoteServerIP, dataPort)
+	kc := c.config.KcpConfig
+	c.handleMux(listener, func() (*smux.Session, error) {
+		baseConn, err := kcp.DialWithOptions(remoteAddr, nil, kc.DataShards, kc.ParityShards)
 		if err != nil {
-			return
+			return nil, err
 		}
-		setKeepAlive(localConn)
-
-		go func(lconn net.Conn) {
-			defer lconn.Close()
-
-			sessMu.Lock()
-			if sess == nil || sess.IsClosed() {
-				if sess != nil {
-					sess.Close()
-				}
-				baseConn, err := kcp.DialWithOptions(config.RemoteServerIP+":"+dataPort, nil, kcpConf.DataShards, kcpConf.ParityShards)
-				if err != nil {
-					logInfo("KCP dial error: " + err.Error())
-					sessMu.Unlock()
-					return
-				}
-				baseConn.SetNoDelay(kcpConf.NoDelay, kcpConf.Interval, kcpConf.Resend, kcpConf.NoCongestion)
-				baseConn.SetWindowSize(kcpConf.SndWnd, kcpConf.RcvWnd)
-				newSess, err := smux.Client(baseConn, getSmuxConfig())
-				if err != nil {
-					baseConn.Close()
-					sessMu.Unlock()
-					return
-				}
-				sess = newSess
-			}
-			currentSess := sess
-			sessMu.Unlock()
-
-			stream, err := currentSess.OpenStream()
-			if err != nil {
-				sessMu.Lock()
-				if sess == currentSess {
-					sess = nil
-				}
-				sessMu.Unlock()
-				return
-			}
-			defer stream.Close()
-			go relayConnections(stream, lconn)
-			relayConnections(lconn, stream)
-		}(localConn)
-	}
+		baseConn.SetNoDelay(kc.NoDelay, kc.Interval, kc.Resend, kc.NoCongestion)
+		baseConn.SetWindowSize(kc.SndWnd, kc.RcvWnd)
+		return smux.Client(baseConn, getSmuxConfig())
+	})
 }
 
-func startQuicDataForwarder(dataPort string) {
+func (c *TunnelClient) forwardQUIC(dataPort string) {
 	expectedCertDER, err := loadPinnedCert()
 	if err != nil {
-		logInfo("QUIC cert error: " + err.Error())
+		slog.Error("QUIC cert error", "err", err)
 		return
 	}
-
 	tlsConf := makePinnedTLSConfig(expectedCertDER, []string{"gtun-quic"})
 
-	listener, err := net.Listen("tcp", config.LocalListenPort)
+	listener, err := net.Listen("tcp", c.config.LocalListenPort)
 	if err != nil {
-		logInfo("QUIC local listen error: " + err.Error())
+		slog.Error("QUIC local listen error", "err", err)
 		return
 	}
-	mu.Lock()
-	activeListener = listener
-	mu.Unlock()
-	logInfo("Ready! Listening locally on " + config.LocalListenPort)
+	c.setListener(listener)
+	slog.Info("Listening locally (QUIC)", "addr", c.config.LocalListenPort)
 
 	var qConn quic.Connection
 	var connMu sync.Mutex
@@ -729,17 +547,14 @@ func startQuicDataForwarder(dataPort string) {
 		setKeepAlive(localConn)
 
 		go func(lconn net.Conn) {
-			defer lconn.Close()
-
 			connMu.Lock()
 			if qConn == nil || qConn.Context().Err() != nil {
-				// کانکشن QUIC قدیمی رو ببند
 				if qConn != nil {
 					qConn.CloseWithError(0, "reconnecting")
 				}
 				newConn, err := quic.DialAddr(
 					context.Background(),
-					config.RemoteServerIP+":"+dataPort,
+					net.JoinHostPort(c.config.RemoteServerIP, dataPort),
 					tlsConf,
 					&quic.Config{
 						KeepAlivePeriod:    10 * time.Second,
@@ -748,7 +563,8 @@ func startQuicDataForwarder(dataPort string) {
 					},
 				)
 				if err != nil {
-					logInfo("QUIC dial error: " + err.Error())
+					slog.Error("QUIC dial error", "err", err)
+					lconn.Close()
 					connMu.Unlock()
 					return
 				}
@@ -759,7 +575,7 @@ func startQuicDataForwarder(dataPort string) {
 
 			stream, err := currentConn.OpenStreamSync(context.Background())
 			if err != nil {
-				// کانکشن مرده، reset کن
+				lconn.Close()
 				connMu.Lock()
 				if qConn == currentConn {
 					qConn = nil
@@ -767,126 +583,93 @@ func startQuicDataForwarder(dataPort string) {
 				connMu.Unlock()
 				return
 			}
-			defer stream.Close()
-			go relayConnections(stream, lconn)
 			relayConnections(lconn, stream)
 		}(localConn)
 	}
 }
 
-// ==================== Main & Control ====================
-
-// connectControl: اتصال به سرور کنترل و احراز هویت
-// FIX: Exponential backoff برای جلوگیری از flood کردن سرور در صورت قطعی
-func main() {
-	loadClientConfiguration()
-
-	// backoff: شروع از 3 ثانیه، حداکثر 60 ثانیه
+// Run Control Channel with Exponential Backoff
+func (c *TunnelClient) Run() {
 	backoff := 3 * time.Second
 	const maxBackoff = 60 * time.Second
 
 	for {
-		logInfo("Connecting to control server " + config.ControlServerAddress + "...")
-		conn, err := net.DialTimeout("tcp", config.ControlServerAddress, 10*time.Second)
+		slog.Info("Connecting to control server", "address", c.config.ControlServerAddress)
+		conn, err := net.DialTimeout("tcp", c.config.ControlServerAddress, 10*time.Second)
 		if err != nil {
-			logInfo(fmt.Sprintf("Connection failed: %s — retrying in %v", err.Error(), backoff))
+			slog.Warn("Connection failed, retrying...", "err", err, "wait", backoff)
 			time.Sleep(backoff)
-			// دو برابر کردن backoff تا سقف maxBackoff
-			backoff *= 2
-			if backoff > maxBackoff {
+			if backoff *= 2; backoff > maxBackoff {
 				backoff = maxBackoff
 			}
 			continue
 		}
 
-		// اتصال موفق — backoff رو ریست کن
 		backoff = 3 * time.Second
-
 		setKeepAlive(conn)
-
-		// deadline برای فاز احراز هویت
 		conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 		reader := bufio.NewReader(conn)
-
-		// 1. دریافت چالش Hex از سرور
 		challengeStr, err := reader.ReadString('\n')
 		if err != nil {
-			logInfo("Error reading challenge: " + err.Error())
+			slog.Error("Error reading challenge", "err", err)
 			conn.Close()
 			continue
 		}
-		challengeHex := strings.TrimSpace(challengeStr)
 
-		// 2. محاسبه HMAC-SHA256 روی چالش
-		mac := hmac.New(sha256.New, []byte(config.Token))
-		mac.Write([]byte(challengeHex))
+		mac := hmac.New(sha256.New, []byte(c.config.Token))
+		mac.Write([]byte(strings.TrimSpace(challengeStr)))
 		responseHex := hex.EncodeToString(mac.Sum(nil))
 
-		// 3. ارسال پاسخ
 		if _, err := conn.Write([]byte(responseHex + "\n")); err != nil {
-			logInfo("Error sending auth response: " + err.Error())
+			slog.Error("Error sending auth response", "err", err)
 			conn.Close()
 			continue
 		}
 
-		// 4. دریافت دستور از سرور
 		msgStr, err := reader.ReadString('\n')
 		if err != nil {
-			logInfo("Error reading server command: " + err.Error())
+			slog.Error("Error reading server command", "err", err)
 			conn.Close()
 			continue
 		}
 
-		// deadline رو پاک کن — اتصال باقی می‌مونه
 		conn.SetDeadline(time.Time{})
 
 		var msg Message
 		if err := json.Unmarshal([]byte(strings.TrimSpace(msgStr)), &msg); err != nil {
-			logInfo("Error parsing server message: " + err.Error())
+			slog.Error("Error parsing server message", "err", err)
 			conn.Close()
 			continue
 		}
 
 		if msg.Command == "start_transport" {
-			stopTransport()
-
-			var transportCfg TransportConfig
-			if err := json.Unmarshal([]byte(msg.Payload), &transportCfg); err != nil {
-				logInfo("Error parsing transport config: " + err.Error())
-				conn.Close()
-				continue
-			}
-
-			logInfo("Starting protocol: " + transportCfg.Protocol + " on port " + transportCfg.Port)
-
-			switch transportCfg.Protocol {
-			case "tcp":
-				go startTcpDataForwarder(transportCfg.Port)
-			case "udp":
-				go startUdpDataForwarder(transportCfg.Port)
-			case "ws":
-				go startWsDataForwarder(transportCfg.Port)
-			case "tcpmux":
-				go startTcpMuxDataForwarder(transportCfg.Port)
-			case "wsmux":
-				go startWsMuxDataForwarder(transportCfg.Port)
-			case "wss":
-				go startWssDataForwarder(transportCfg.Port)
-			case "wssmux":
-				go startWssMuxDataForwarder(transportCfg.Port)
-			case "utcpmux":
-				go startUtcpMuxDataForwarder(transportCfg.Port)
-			case "quic":
-				go startQuicDataForwarder(transportCfg.Port)
-			default:
-				logInfo("Unknown protocol received: " + transportCfg.Protocol)
+			var tCfg TransportConfig
+			if err := json.Unmarshal([]byte(msg.Payload), &tCfg); err == nil {
+				c.startForwarder(tCfg.Protocol, tCfg.Port)
 			}
 		}
 
-		// صبر تا قطع شدن کانکشن کنترل
 		reader.ReadString('\n')
 		conn.Close()
-		logInfo("Control connection lost — reconnecting...")
+		slog.Warn("Control connection lost, reconnecting...")
 	}
+}
+
+func main() {
+	file, err := os.Open("client_config.json")
+	if err != nil {
+		slog.Error("Failed to open client_config.json", "err", err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
+	var cfg ClientConfig
+	if err := json.NewDecoder(file).Decode(&cfg); err != nil {
+		slog.Error("Failed to parse config", "err", err)
+		os.Exit(1)
+	}
+
+	client := NewTunnelClient(cfg)
+	client.Run()
 }
