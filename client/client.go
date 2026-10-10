@@ -71,7 +71,7 @@ var bufferPool = sync.Pool{
 	New: func() any { b := make([]byte, 64*1024); return &b },
 }
 
-// relayConnections: نسخه ویرایش شده برای دیباگ و مشاهده ترافیک عبوری (Sniffing)
+// relayConnections: شامل سیستم Sniffing و چاپ Hex Dump
 func relayConnections(conn1, conn2 io.ReadWriteCloser) {
 	defer conn1.Close()
 	defer conn2.Close()
@@ -85,12 +85,9 @@ func relayConnections(conn1, conn2 io.ReadWriteCloser) {
 		for {
 			n, err := src.Read(buf)
 			if n > 0 {
-				// 1. چاپ جهت انتقال دیتا و حجم بسته
 				fmt.Printf("\n[DEBUG] %s | %d bytes\n", direction, n)
-				// 2. چاپ دیتای خام به شکل Hex Dump
 				fmt.Print(hex.Dump(buf[:n]))
 
-				// 3. ارسال به مقصد
 				_, werr := dst.Write(buf[:n])
 				if werr != nil {
 					errChan <- werr
@@ -104,12 +101,10 @@ func relayConnections(conn1, conn2 io.ReadWriteCloser) {
 		}
 	}
 
-	// conn1: اتصال محلی (برنامه سمت کاربر/V2ray)
-	// conn2: اتصال به سرور (تونل)
 	go copyFunc(conn2, conn1, "Local App ➔ Tunnel")
 	go copyFunc(conn1, conn2, "Tunnel ➔ Local App")
 
-	<-errChan // منتظر می‌ماند تا یکی از اتصالات قطع شود
+	<-errChan
 }
 
 type wsConnWrapper struct {
@@ -217,9 +212,66 @@ func (c *TunnelClient) setListener(l io.Closer) {
 	c.activeListener = l
 }
 
+// ==================== CONNECTION TESTER ====================
+// این متد برای تست اتوماتیک تانل پس از برقراری ارتباط فراخوانی می‌شود
+func (c *TunnelClient) runConnectionTest(proto string) {
+	// صبر می‌کنیم تا لیسنر کلاینت (TCP/UDP) کاملاً آماده شود
+	time.Sleep(1 * time.Second)
+
+	slog.Info("==================================================")
+	slog.Info(fmt.Sprintf(" STARTING AUTOMATED TUNNEL TEST VIA [%s]", strings.ToUpper(proto)))
+	slog.Info("==================================================")
+
+	network := "tcp"
+	if proto == "udp" {
+		network = "udp"
+	}
+
+	// تبدیل 0.0.0.0 به 127.0.0.1 برای لوکال هاست
+	host, port, err := net.SplitHostPort(c.config.LocalListenPort)
+	if err != nil || host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	localAddr := net.JoinHostPort(host, port)
+
+	var conn net.Conn
+	if network == "tcp" {
+		conn, err = net.DialTimeout("tcp", localAddr, 3*time.Second)
+	} else {
+		udpAddr, _ := net.ResolveUDPAddr("udp", localAddr)
+		conn, err = net.DialUDP("udp", nil, udpAddr)
+	}
+
+	if err != nil {
+		slog.Error("Tunnel Test Failed: Cannot connect to local listener", "err", err)
+		return
+	}
+	defer conn.Close()
+
+	// ارسال ۳ بسته تستی
+	for i := 1; i <= 3; i++ {
+		packetData := []byte(fmt.Sprintf("=== [G-TUN TEST PACKET %d] VIA %s ===", i, strings.ToUpper(proto)))
+		_, err := conn.Write(packetData)
+		if err != nil {
+			// اگر سرور/Xray اتصال را قطع کرد
+			slog.Warn("Test connection closed by remote (Expected if Xray rejects text data)", "packet", i)
+			break
+		}
+		slog.Info("Tunnel Test Packet Sent Successfully", "packet", i)
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	slog.Info("==================================================")
+	slog.Info(" AUTOMATED TUNNEL TEST COMPLETED ")
+	slog.Info("==================================================")
+}
+
 func (c *TunnelClient) startForwarder(proto, port string) {
 	c.stopTransport()
 	slog.Info("Starting protocol", "protocol", proto, "port", port)
+
+	// اجرای تست اتصال در پس‌زمینه (همزمان با راه‌اندازی پروتکل)
+	go c.runConnectionTest(proto)
 
 	switch proto {
 	case "tcp":
@@ -244,6 +296,8 @@ func (c *TunnelClient) startForwarder(proto, port string) {
 		slog.Warn("Unknown protocol received", "protocol", proto)
 	}
 }
+
+// ==================== Protocol Implementations ====================
 
 func (c *TunnelClient) forwardTCP(dataPort string) {
 	listener, err := net.Listen("tcp", c.config.LocalListenPort)
@@ -346,7 +400,10 @@ func (c *TunnelClient) forwardUDP(dataPort string) {
 						rconn.Close()
 						return
 					}
-					// به دلیل ماهیت کانکشن‌لس UDP در اینجا فقط دیتای خام رله می‌شود
+
+					fmt.Printf("\n[DEBUG] Tunnel ➔ Local App | %d bytes\n", m)
+					fmt.Print(hex.Dump((*remoteBufPtr)[:m]))
+
 					localConn.WriteToUDP((*remoteBufPtr)[:m], cAddr)
 				}
 			}(remoteConn, clientAddr, clientAddr.String())
@@ -357,6 +414,10 @@ func (c *TunnelClient) forwardUDP(dataPort string) {
 		mapMutex.Unlock()
 
 		currentConn.SetDeadline(time.Now().Add(UDPIdleTimeout))
+
+		fmt.Printf("\n[DEBUG] Local App ➔ Tunnel | %d bytes\n", n)
+		fmt.Print(hex.Dump(buf[:n]))
+
 		currentConn.Write(buf[:n])
 	}
 }
@@ -601,7 +662,7 @@ func (c *TunnelClient) forwardQUIC(dataPort string) {
 				connMu.Unlock()
 				return
 			}
-			relayConnections(lconn, stream) // دیتای این قسمت هگز دامپ خواهد شد
+			relayConnections(lconn, stream)
 		}(localConn)
 	}
 }
