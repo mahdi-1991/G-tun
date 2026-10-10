@@ -271,7 +271,7 @@ func (c *TunnelClient) startForwarder(proto, port string) {
 	slog.Info("Starting protocol", "protocol", proto, "port", port)
 
 	// اجرای تست اتصال در پس‌زمینه (همزمان با راه‌اندازی پروتکل)
-	go c.runConnectionTest(proto)
+	// go c.runConnectionTest(proto)
 
 	switch proto {
 	case "tcp":
