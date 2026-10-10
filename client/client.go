@@ -71,22 +71,45 @@ var bufferPool = sync.Pool{
 	New: func() any { b := make([]byte, 64*1024); return &b },
 }
 
-// relayConnections safely copies data bidirectionally and ensures both connections close on exit.
+// relayConnections: نسخه ویرایش شده برای دیباگ و مشاهده ترافیک عبوری (Sniffing)
 func relayConnections(conn1, conn2 io.ReadWriteCloser) {
 	defer conn1.Close()
 	defer conn2.Close()
 	errChan := make(chan error, 2)
 
-	copyFunc := func(dst io.Writer, src io.Reader) {
+	copyFunc := func(dst io.Writer, src io.Reader, direction string) {
 		bufPtr := bufferPool.Get().(*[]byte)
 		defer bufferPool.Put(bufPtr)
-		_, err := io.CopyBuffer(dst, src, *bufPtr)
-		errChan <- err
+		buf := *bufPtr
+
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				// 1. چاپ جهت انتقال دیتا و حجم بسته
+				fmt.Printf("\n[DEBUG] %s | %d bytes\n", direction, n)
+				// 2. چاپ دیتای خام به شکل Hex Dump
+				fmt.Print(hex.Dump(buf[:n]))
+
+				// 3. ارسال به مقصد
+				_, werr := dst.Write(buf[:n])
+				if werr != nil {
+					errChan <- werr
+					return
+				}
+			}
+			if err != nil {
+				errChan <- err
+				return
+			}
+		}
 	}
 
-	go copyFunc(conn1, conn2)
-	go copyFunc(conn2, conn1)
-	<-errChan // Block until one side errors or closes
+	// conn1: اتصال محلی (برنامه سمت کاربر/V2ray)
+	// conn2: اتصال به سرور (تونل)
+	go copyFunc(conn2, conn1, "Local App ➔ Tunnel")
+	go copyFunc(conn1, conn2, "Tunnel ➔ Local App")
+
+	<-errChan // منتظر می‌ماند تا یکی از اتصالات قطع شود
 }
 
 type wsConnWrapper struct {
@@ -156,7 +179,7 @@ func loadPinnedCert() ([]byte, error) {
 
 func makePinnedTLSConfig(expectedCertDER []byte, nextProtos []string) *tls.Config {
 	return &tls.Config{
-		InsecureSkipVerify: true, // Verification handled below
+		InsecureSkipVerify: true,
 		NextProtos:         nextProtos,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 || !bytes.Equal(rawCerts[0], expectedCertDER) {
@@ -222,7 +245,6 @@ func (c *TunnelClient) startForwarder(proto, port string) {
 	}
 }
 
-// forwardTCP implements standard TCP forwarding.
 func (c *TunnelClient) forwardTCP(dataPort string) {
 	listener, err := net.Listen("tcp", c.config.LocalListenPort)
 	if err != nil {
@@ -253,7 +275,6 @@ func (c *TunnelClient) forwardTCP(dataPort string) {
 	}
 }
 
-// forwardUDP handles UDP forwarding with proper session cleanup.
 func (c *TunnelClient) forwardUDP(dataPort string) {
 	localAddr, err := net.ResolveUDPAddr("udp", c.config.LocalListenPort)
 	if err != nil {
@@ -276,7 +297,6 @@ func (c *TunnelClient) forwardUDP(dataPort string) {
 	sessions := make(map[string]*udpSession)
 	var mapMutex sync.Mutex
 
-	// Cleanup Routine
 	go func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -326,6 +346,7 @@ func (c *TunnelClient) forwardUDP(dataPort string) {
 						rconn.Close()
 						return
 					}
+					// به دلیل ماهیت کانکشن‌لس UDP در اینجا فقط دیتای خام رله می‌شود
 					localConn.WriteToUDP((*remoteBufPtr)[:m], cAddr)
 				}
 			}(remoteConn, clientAddr, clientAddr.String())
@@ -340,12 +361,10 @@ func (c *TunnelClient) forwardUDP(dataPort string) {
 	}
 }
 
-// forwardWS handles WebSocket forwarding.
 func (c *TunnelClient) forwardWS(dataPort string) {
 	c.serveWebSocket("ws", dataPort, nil)
 }
 
-// forwardWSS handles Secure WebSocket forwarding.
 func (c *TunnelClient) forwardWSS(dataPort string) {
 	expectedCertDER, err := loadPinnedCert()
 	if err != nil {
@@ -389,7 +408,6 @@ func (c *TunnelClient) serveWebSocket(scheme, port string, dialer *websocket.Dia
 	}
 }
 
-// handleMux simplifies smux session management
 func (c *TunnelClient) handleMux(listener net.Listener, dialFunc func() (*smux.Session, error)) {
 	var sess *smux.Session
 	var sessMu sync.Mutex
@@ -583,12 +601,11 @@ func (c *TunnelClient) forwardQUIC(dataPort string) {
 				connMu.Unlock()
 				return
 			}
-			relayConnections(lconn, stream)
+			relayConnections(lconn, stream) // دیتای این قسمت هگز دامپ خواهد شد
 		}(localConn)
 	}
 }
 
-// Run Control Channel with Exponential Backoff
 func (c *TunnelClient) Run() {
 	backoff := 3 * time.Second
 	const maxBackoff = 60 * time.Second
