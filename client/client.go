@@ -85,8 +85,8 @@ func relayConnections(conn1, conn2 io.ReadWriteCloser) {
 		for {
 			n, err := src.Read(buf)
 			if n > 0 {
-				fmt.Printf("\n[DEBUG] %s | %d bytes\n", direction, n)
-				fmt.Print(hex.Dump(buf[:n]))
+				// fmt.Printf("\n[DEBUG] %s | %d bytes\n", direction, n)
+				// fmt.Print(hex.Dump(buf[:n]))
 
 				_, werr := dst.Write(buf[:n])
 				if werr != nil {
