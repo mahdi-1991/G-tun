@@ -1,0 +1,4 @@
+# Keep line endings as LF so the shell scripts run on Linux no matter where they were edited.
+* text=auto eol=lf
+*.sh text eol=lf
+*.go text eol=lf

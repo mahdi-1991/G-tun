@@ -1,0 +1,15 @@
+# Build output
+/bin/
+/g-tun-server
+/g-tun-client
+/g-tun-gencert
+
+# Secrets and local configuration
+*.pem
+server_config.json
+client_config.json
+
+# Editor files
+.idea/
+.vscode/
+*.swp

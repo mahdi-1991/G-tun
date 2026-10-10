@@ -1,158 +1,124 @@
-#!/bin/bash
-# G-Tun Full Control Panel
-# Refactored for Clean Code and ShellCheck compliance
+#!/usr/bin/env bash
+# G-Tun control panel.
+set -uo pipefail
 
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[0;33m'
-readonly CYAN='\033[0;36m'
-readonly NC='\033[0m'
+readonly RED=$'\033[0;31m' GREEN=$'\033[0;32m' YELLOW=$'\033[0;33m' CYAN=$'\033[0;36m' NC=$'\033[0m'
+readonly CONF_DIR="/etc/g-tun"
 readonly WORK_DIR="/root/G-tun-Project"
-readonly GO_BIN="/usr/local/go/bin/go"
+readonly UNIT_DIR="/etc/systemd/system"
 
-# Global states
-ROLE=""
-SVC=""
-CONF=""
+if [[ ${EUID} -ne 0 ]]; then
+  echo "${RED}Please run as root.${NC}"
+  exit 1
+fi
 
-check_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo -e "${RED}Error: Please run as root.${NC}" >&2
-    exit 1
+if [[ -f ${UNIT_DIR}/g-tun-server.service ]]; then
+  ROLE=server
+elif [[ -f ${UNIT_DIR}/g-tun-client.service ]]; then
+  ROLE=client
+else
+  echo "${RED}Error: G-Tun is not installed.${NC}"
+  exit 1
+fi
+readonly ROLE
+readonly SERVICE="g-tun-${ROLE}"
+readonly CONFIG="${CONF_DIR}/${ROLE}_config.json"
+readonly BINARY="/usr/local/bin/g-tun-${ROLE}"
+
+pause() {
+  read -r -p "Press Enter to return..." _
+}
+
+show_status() {
+  if [[ $(systemctl is-active "${SERVICE}") == active ]]; then
+    echo " Status: [${GREEN}RUNNING${NC}]"
+  else
+    echo " Status: [${RED}STOPPED${NC}]"
   fi
 }
 
-init_env() {
-  if [[ -f "/etc/systemd/system/g-tun-server.service" ]]; then
-    ROLE="Server"
-    SVC="g-tun-server"
-    CONF="/etc/g-tun/server_config.json"
-  elif [[ -f "/etc/systemd/system/g-tun-client.service" ]]; then
-    ROLE="Client"
-    SVC="g-tun-client"
-    CONF="/etc/g-tun/client_config.json"
+show_token() {
+  local token
+  token="$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${CONFIG}" | head -n 1)"
+  echo -e "\n${YELLOW}--- Your Secret Token ---${NC}\n${token}\n"
+}
+
+edit_config() {
+  "${EDITOR:-nano}" "${CONFIG}"
+  if "${BINARY}" -config "${CONFIG}" -check > /dev/null; then
+    systemctl restart "${SERVICE}"
+    echo "${GREEN}Config saved and service restarted.${NC}"
   else
-    echo -e "${RED}Error: G-Tun is not installed.${NC}" >&2
-    exit 1
+    echo "${RED}The configuration is invalid; the service was NOT restarted:${NC}"
+    "${BINARY}" -config "${CONFIG}" -check
   fi
 }
 
 update_gtun() {
-  echo -e "${YELLOW}Updating G-Tun from GitHub...${NC}"
-  cd "${WORK_DIR}" || { echo -e "${RED}Work directory not found.${NC}"; sleep 2; return; }
-  
-  if ! git pull origin main; then
-    echo -e "${RED}Failed to pull from GitHub.${NC}"
-    sleep 2
-    return
-  fi
-  
-  echo -e "${YELLOW}Rebuilding binaries...${NC}"
-  if [[ "${ROLE}" == "Server" ]]; then
-    cd server || exit 1
-    "${GO_BIN}" get github.com/quic-go/quic-go@v0.48.2
-    "${GO_BIN}" mod tidy
-    if ! "${GO_BIN}" build -o g-tun-server server.go; then
-       echo -e "${RED}Build failed!${NC}"; sleep 2; return;
-    fi
-    mv g-tun-server /usr/local/bin/
+  echo "${YELLOW}Updating G-Tun from GitHub...${NC}"
+  if bash "${WORK_DIR}/install.sh" --update; then
+    echo "${GREEN}Update completed successfully.${NC}"
   else
-    cd client || exit 1
-    "${GO_BIN}" get github.com/quic-go/quic-go@v0.48.2
-    "${GO_BIN}" mod tidy
-    if ! "${GO_BIN}" build -o g-tun-client client.go; then
-       echo -e "${RED}Build failed!${NC}"; sleep 2; return;
-    fi
-    mv g-tun-client /usr/local/bin/
+    echo "${RED}Update failed.${NC}"
   fi
-  
-  systemctl restart "${SVC}"
-  echo -e "${GREEN}Update completed successfully! Service restarted.${NC}"
-  sleep 2
 }
 
 uninstall_gtun() {
-  local confirm
-  echo -e "${RED}WARNING: You are about to completely uninstall G-Tun!${NC}"
-  read -r -p "Are you sure? (y/n): " confirm
-  
-  if [[ "${confirm,,}" == "y" ]]; then
-    echo -e "${YELLOW}Stopping and disabling services...${NC}"
-    systemctl stop "${SVC}" 2>/dev/null || true
-    systemctl disable "${SVC}" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SVC}.service"
-    systemctl daemon-reload
-    
-    echo -e "${YELLOW}Removing binaries and configurations...${NC}"
-    rm -f /usr/local/bin/g-tun-server /usr/local/bin/g-tun-client
-    rm -rf /etc/g-tun
-    rm -rf "${WORK_DIR}"
-    
-    echo -e "${GREEN}G-Tun has been completely uninstalled.${NC}"
-    rm -f /usr/bin/g-tun
-    exit 0
-  else
-    echo -e "${GREEN}Uninstall cancelled.${NC}"
-    sleep 1
+  echo "${RED}WARNING: You are about to completely uninstall G-Tun!${NC}"
+  local answer
+  read -r -p "Are you sure? (y/n): " answer
+  if [[ ${answer} != [yY] ]]; then
+    echo "${GREEN}Uninstall cancelled.${NC}"
+    return
   fi
+  systemctl disable --now "${SERVICE}" 2> /dev/null
+  rm -f "${UNIT_DIR}/${SERVICE}.service" "${BINARY}" /etc/sysctl.d/99-gtun.conf
+  systemctl daemon-reload
+  rm -rf "${CONF_DIR}" "${WORK_DIR}" /usr/bin/g-tun
+  echo "${GREEN}G-Tun has been completely uninstalled.${NC}"
+  exit 0
 }
 
 show_menu() {
-  while true; do
-    clear
-    echo -e "${CYAN}==========================================${NC}"
-    echo -e "${GREEN}        G-TUN FULL CONTROL PANEL        ${NC}"
-    echo -e "${CYAN}==========================================${NC}"
-    
-    if systemctl is-active --quiet "${SVC}"; then
-      echo -e " Mode:   [${YELLOW}${ROLE}${NC}]"
-      echo -e " Status: [${GREEN}RUNNING${NC}]"
-    else
-      echo -e " Mode:   [${YELLOW}${ROLE}${NC}]"
-      echo -e " Status: [${RED}STOPPED${NC}]"
-    fi
-    
-    echo -e "${CYAN}------------------------------------------${NC}"
-    echo " 1) Start G-Tun Service"
-    echo " 2) Stop G-Tun Service"
-    echo " 3) Restart G-Tun Service"
-    echo " 4) View Live Logs (Press Ctrl+C to exit)"
-    echo " 5) View Full Configuration"
-    echo " 6) Show Secret Token"
-    echo " 7) Edit Configuration (Requires Restart)"
-    echo " 8) Update G-Tun to Latest Version"
-    echo " 9) Uninstall G-Tun Completely"
-    echo " 0) Exit Panel"
-    echo -e "${CYAN}==========================================${NC}"
-    
-    local choice
-    read -r -p " Enter your choice [0-9]: " choice
+  clear
+  echo "${CYAN}==========================================${NC}"
+  echo "${GREEN}        G-TUN FULL CONTROL PANEL          ${NC}"
+  echo "${CYAN}==========================================${NC}"
+  echo " Mode:   [${YELLOW}${ROLE^}${NC}]"
+  show_status
+  echo "${CYAN}------------------------------------------${NC}"
+  echo " 1) Start G-Tun Service"
+  echo " 2) Stop G-Tun Service"
+  echo " 3) Restart G-Tun Service"
+  echo " 4) View Live Logs (Press Ctrl+C to exit)"
+  echo " 5) View Full Configuration"
+  echo " 6) Show Secret Token"
+  echo " 7) Edit Configuration"
+  echo " 8) Update G-Tun to Latest Version"
+  echo " 9) Uninstall G-Tun Completely"
+  echo " 0) Exit Panel"
+  echo "${CYAN}==========================================${NC}"
+}
 
-    case "${choice}" in
-      1) systemctl start "${SVC}"; echo -e "${GREEN}Service Started.${NC}"; sleep 1 ;;
-      2) systemctl stop "${SVC}"; echo -e "${RED}Service Stopped.${NC}"; sleep 1 ;;
-      3) systemctl restart "${SVC}"; echo -e "${YELLOW}Service Restarted.${NC}"; sleep 1 ;;
-      4) echo -e "${YELLOW}Fetching logs... Press Ctrl+C to stop.${NC}"; journalctl -u "${SVC}" -f ;;
-      5) echo -e "\n${CYAN}--- Current Configuration ---${NC}"; cat "${CONF}"; echo ""; read -r -p "Press Enter to return..." ;;
-      6) 
-         local token
-         token=$(grep '"token"' "${CONF}" | cut -d '"' -f 4)
-         echo -e "\n${YELLOW}--- Your Secret Token ---${NC}\n${token}\n"
-         read -r -p "Press Enter to return..." 
-         ;;
-      7) nano "${CONF}"; systemctl restart "${SVC}"; echo -e "${GREEN}Config saved and service restarted.${NC}"; sleep 1 ;;
-      8) update_gtun ;;
+main() {
+  local choice
+  while true; do
+    show_menu
+    read -r -p " Enter your choice [0-9]: " choice
+    case ${choice} in
+      1) systemctl start "${SERVICE}" && echo "${GREEN}Service started.${NC}"; sleep 1 ;;
+      2) systemctl stop "${SERVICE}" && echo "${RED}Service stopped.${NC}"; sleep 1 ;;
+      3) systemctl restart "${SERVICE}" && echo "${YELLOW}Service restarted.${NC}"; sleep 1 ;;
+      4) journalctl -u "${SERVICE}" -f || true ;;
+      5) echo -e "\n${CYAN}--- Current Configuration ---${NC}"; cat "${CONFIG}"; echo; pause ;;
+      6) show_token; pause ;;
+      7) edit_config; sleep 2 ;;
+      8) update_gtun; pause ;;
       9) uninstall_gtun ;;
       0) clear; exit 0 ;;
-      *) echo -e "${RED}Invalid choice!${NC}"; sleep 1 ;;
+      *) echo "${RED}Invalid choice!${NC}"; sleep 1 ;;
     esac
   done
 }
 
-main() {
-  check_root
-  init_env
-  show_menu
-}
-
-main "$@"
+main

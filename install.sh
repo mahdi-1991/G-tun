@@ -1,29 +1,86 @@
-#!/bin/bash
-# G-Tun Setup and Installation Script
-# Refactored for Modularity and Safe Execution
-
+#!/usr/bin/env bash
+# G-Tun installer and updater.
+#
+#   install.sh            interactive installation of a server or a client
+#   install.sh --update   rebuild and restart the installed role, keeping its configuration
 set -euo pipefail
 
+readonly REPO_URL="https://github.com/mahdi-1991/G-tun.git"
 readonly WORK_DIR="/root/G-tun-Project"
-readonly GO_BIN="/usr/local/go/bin/go"
-export PATH="/usr/local/go/bin:${PATH}"
+readonly CONF_DIR="/etc/g-tun"
+readonly BIN_DIR="/usr/local/bin"
+readonly GO_VERSION="1.23.4"
+readonly GO_ROOT="/usr/local/go"
+readonly UNIT_DIR="/etc/systemd/system"
 
-check_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "Error: Please run this script as root." >&2
-    exit 1
-  fi
+export PATH="${GO_ROOT}/bin:${PATH}"
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
 }
 
+info() {
+  echo "==> $*"
+}
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || die "please run this script as root."
+}
+
+# ---------------------------------------------------------------- validation
+
+valid_port() {
+  [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
+}
+
+# Accepts a host name, an IPv4 address or a bracketed or bare IPv6 address.
+valid_host() {
+  local pattern='^[][A-Za-z0-9._:-]+$'
+  [[ $1 =~ ${pattern} ]]
+}
+
+valid_hostport() {
+  local host="${1%:*}" port="${1##*:}"
+  [[ -n ${host} && ${1} == *:* ]] && valid_host "${host}" && valid_port "${port}"
+}
+
+# prompt VAR "Question" [default] [validator]
+prompt() {
+  local var=$1 question=$2 default=${3:-} validator=${4:-} answer
+  while true; do
+    if [[ -n ${default} ]]; then
+      read -r -p "${question} (default ${default}): " answer
+      answer=${answer:-${default}}
+    else
+      read -r -p "${question}: " answer
+    fi
+    if [[ -z ${validator} ]] || ${validator} "${answer}"; then
+      printf -v "${var}" '%s' "${answer}"
+      return
+    fi
+    echo "Invalid value, please try again."
+  done
+}
+
+# json_value FILE KEY prints the string value of KEY in a flat JSON file.
+json_value() {
+  [[ -f $1 ]] || return 0
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n 1
+}
+
+# ---------------------------------------------------------------- system
+
 install_dependencies() {
-  echo "Checking and installing dependencies..."
-  DEBIAN_FRONTEND=noninteractive apt-get update -y -q
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q git curl wget tar systemd openssl nano
+  info "Installing dependencies"
+  apt-get update -y
+  apt-get install -y git curl wget tar openssl nano ca-certificates
 }
 
 tune_system() {
-  echo "Tuning system for maximum network performance (BBR & Buffers)..."
-  cat <<EOF > /etc/sysctl.d/99-gtun.conf
+  info "Tuning the network stack (BBR and larger buffers)"
+  modprobe tcp_bbr 2>/dev/null || true
+  cat > /etc/sysctl.d/99-gtun.conf <<'SYSCTL'
 fs.file-max = 1048576
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
@@ -35,246 +92,274 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-EOF
-  sysctl --system > /dev/null 2>&1
-  echo "System tuned successfully!"
+SYSCTL
+  sysctl --system > /dev/null 2>&1 || echo "Warning: some sysctl settings could not be applied." >&2
 }
 
 install_go() {
-  if [[ ! -x "${GO_BIN}" ]] || ! "${GO_BIN}" version | grep -q "go1.23"; then
-    echo "Installing Go 1.23.0..."
-    wget -q https://go.dev/dl/go1.23.0.linux-amd64.tar.gz -O /tmp/go1.23.0.tar.gz
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf /tmp/go1.23.0.tar.gz
-    rm /tmp/go1.23.0.tar.gz
+  if [[ -x ${GO_ROOT}/bin/go ]] && "${GO_ROOT}/bin/go" version | grep -qE 'go1\.(2[3-9]|[3-9][0-9])'; then
+    return
   fi
+  local arch
+  case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *) die "unsupported CPU architecture: $(uname -m)" ;;
+  esac
+  info "Installing Go ${GO_VERSION} (${arch})"
+  local tarball
+  tarball="$(mktemp)"
+  wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" -O "${tarball}"
+  rm -rf "${GO_ROOT}"
+  tar -C /usr/local -xzf "${tarball}"
+  rm -f "${tarball}"
 }
 
 fetch_source() {
-  if [[ ! -d "${WORK_DIR}" ]]; then
-    git clone https://github.com/mahdi-1991/G-tun.git "${WORK_DIR}"
+  info "Fetching the source code"
+  if [[ -d ${WORK_DIR}/.git ]]; then
+    git -C "${WORK_DIR}" fetch --quiet origin main
+    git -C "${WORK_DIR}" reset --quiet --hard origin/main
+  else
+    rm -rf "${WORK_DIR}"
+    git clone --quiet "${REPO_URL}" "${WORK_DIR}"
   fi
-  cd "${WORK_DIR}"
-  git pull origin main || true
 }
 
-setup_server() {
-  local control_port="$1"
-  local proto_choice protocol xray_addr data_port secret_token
+# build_binary NAME builds ./cmd/NAME and installs it atomically.
+build_binary() {
+  local name=$1 version tmp
+  info "Building ${name}"
+  version="$(git -C "${WORK_DIR}" describe --always --dirty 2>/dev/null || echo dev)"
+  tmp="$(mktemp)"
+  (
+    cd "${WORK_DIR}"
+    # -mod=mod lets Go record missing go.sum entries, verified against the checksum database.
+    GOFLAGS=-mod=mod go build -trimpath -ldflags "-s -w -X main.version=${version}" -o "${tmp}" "./cmd/${name}"
+  )
+  install -m 0755 "${tmp}" "${BIN_DIR}/${name}"
+  rm -f "${tmp}"
+}
 
+# write_service ROLE writes and reloads the systemd unit for server or client.
+write_service() {
+  local role=$1
+  cat > "${UNIT_DIR}/g-tun-${role}.service" <<UNIT
+[Unit]
+Description=G-Tun ${role^} Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${CONF_DIR}
+ExecStart=${BIN_DIR}/g-tun-${role} -config ${CONF_DIR}/${role}_config.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+Environment=GOGC=400
+Environment=GOMEMLIMIT=768MiB
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+}
+
+install_panel() {
+  install -m 0755 "${WORK_DIR}/g-tun.sh" /usr/bin/g-tun
+}
+
+# ---------------------------------------------------------------- roles
+
+setup_server() {
+  local control_port data_port protocol target token choice
+
+  prompt control_port "Enter Control Port" 8080 valid_port
   echo "------------------------------------------"
   echo "Select Protocol:"
   echo "1) tcp    2) udp      3) ws       4) tcpmux"
   echo "5) wsmux  6) wss      7) wssmux   8) utcpmux (KCP)"
-  echo "9) quic (HTTP/3 - Best for Anti-Censorship)"
-  read -r -p "Enter choice [1-9] (default 9): " proto_choice
-  
-  case "${proto_choice}" in
-    1) protocol="tcp" ;;
-    2) protocol="udp" ;;
-    3) protocol="ws" ;;
-    4) protocol="tcpmux" ;;
-    5) protocol="wsmux" ;;
-    6) protocol="wss" ;;
-    7) protocol="wssmux" ;;
-    8) protocol="utcpmux" ;;
-    *) protocol="quic" ;;
+  echo "9) quic   (best against censorship)"
+  read -r -p "Enter choice [1-9] (default 9): " choice
+  case ${choice:-9} in
+    1) protocol=tcp ;;
+    2) protocol=udp ;;
+    3) protocol=ws ;;
+    4) protocol=tcpmux ;;
+    5) protocol=wsmux ;;
+    6) protocol=wss ;;
+    7) protocol=wssmux ;;
+    8) protocol=utcpmux ;;
+    *) protocol=quic ;;
   esac
 
-  read -r -p "Enter Xray/Destination Address (default 127.0.0.1:10085): " xray_addr
-  xray_addr="${xray_addr:-127.0.0.1:10085}"
+  prompt target "Enter Xray/Destination Address" 127.0.0.1:10085 valid_hostport
+  prompt data_port "Enter Data Port for Tunnel" 8081 valid_port
 
-  read -r -p "Enter Data Port for Tunnel (default 8081): " data_port
-  data_port="${data_port:-8081}"
-
-  secret_token=""
-  if [[ -f /etc/g-tun/server_config.json ]]; then
-    secret_token=$(grep '"token"' /etc/g-tun/server_config.json | cut -d '"' -f 4 || true)
+  token="$(json_value "${CONF_DIR}/server_config.json" token)"
+  if [[ -z ${token} ]]; then
+    info "Generating a 64-character token"
+    token="$(openssl rand -hex 32)"
   fi
 
-  if [[ -z "${secret_token}" ]]; then
-    echo "Generating secure 64-character token..."
-    if command -v openssl >/dev/null 2>&1; then
-      secret_token=$(openssl rand -hex 32)
-    else
-      secret_token=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64)
-    fi
-  fi
+  mkdir -p "${CONF_DIR}"
+  chmod 700 "${CONF_DIR}"
 
-  echo "Checking TLS Certificates..."
-  if [[ ! -s /etc/g-tun/cert.pem ]] || [[ ! -s /etc/g-tun/key.pem ]]; then
-    echo "Generating new ECC Certificates for WSS & QUIC..."
-    cd "${WORK_DIR}/server"
-    "${GO_BIN}" run generate_cert.go
-    cp cert.pem /etc/g-tun/cert.pem
-    cp key.pem /etc/g-tun/key.pem
+  if [[ ! -s ${CONF_DIR}/cert.pem || ! -s ${CONF_DIR}/key.pem ]]; then
+    info "Generating a TLS certificate"
+    (cd "${WORK_DIR}" && GOFLAGS=-mod=mod go run ./cmd/g-tun-gencert -cert "${CONF_DIR}/cert.pem" -key "${CONF_DIR}/key.pem")
   else
-    echo "Found existing certificates in /etc/g-tun/. Keeping them to prevent client disconnections."
+    info "Keeping the existing certificate so clients stay connected"
   fi
+  chmod 600 "${CONF_DIR}/key.pem"
 
-  cat <<EOF > /etc/g-tun/server_config.json
+  (
+    umask 077
+    cat > "${CONF_DIR}/server_config.json" <<JSON
 {
     "control_port": "${control_port}",
     "data_port": "${data_port}",
     "protocol": "${protocol}",
-    "xray_inbound_address": "${xray_addr}",
-    "token": "${secret_token}",
-    "tls_cert_path": "/etc/g-tun/cert.pem",
-    "tls_key_path": "/etc/g-tun/key.pem",
+    "xray_inbound_address": "${target}",
+    "token": "${token}",
+    "tls_cert_path": "${CONF_DIR}/cert.pem",
+    "tls_key_path": "${CONF_DIR}/key.pem",
     "kcp_config": {
         "NoDelay": 1, "Interval": 20, "Resend": 2, "NoCongestion": 1,
         "SndWnd": 4096, "RcvWnd": 4096, "DataShards": 10, "ParityShards": 3
     }
 }
-EOF
+JSON
+  )
 
-  echo "Building Server Binary..."
-  cd "${WORK_DIR}/server"
-  "${GO_BIN}" get github.com/quic-go/quic-go@v0.48.2
-  "${GO_BIN}" mod tidy
-  "${GO_BIN}" build -o g-tun-server server.go
-  mv g-tun-server /usr/local/bin/
+  build_binary g-tun-server
+  "${BIN_DIR}/g-tun-server" -config "${CONF_DIR}/server_config.json" -check
+  write_service server
+  systemctl enable g-tun-server
+  systemctl restart g-tun-server
+  install_panel
 
-  cat <<EOF > /etc/systemd/system/g-tun-server.service
-[Unit]
-Description=G-Tun Server Service
-After=network.target
+  cat <<DONE
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/etc/g-tun
-ExecStart=/usr/local/bin/g-tun-server
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-Environment="GOGC=400"
-Environment="GOMEMLIMIT=768MiB"
+==========================================================================
+                     SERVER INSTALLATION SUCCESSFUL
+==========================================================================
+ Protocol: ${protocol}
+ Open these ports in your firewall: control ${control_port}/tcp, data ${data_port}
 
-[Install]
-WantedBy=multi-user.target
-EOF
+ Use this token during client installation:
 
-  systemctl daemon-reload
-  systemctl enable --now g-tun-server
-  
-  cp "${WORK_DIR}/g-tun.sh" /usr/bin/g-tun
-  chmod +x /usr/bin/g-tun
-  
-  echo -e "\n=========================================================================="
-  echo "                     SERVER INSTALLATION SUCCESSFUL                       "
-  echo "=========================================================================="
-  echo " Protocol Selected: ${protocol} "
-  echo " Copy the 64-character token below and use it during client installation: "
-  echo -e "\n TOKEN: ${secret_token}\n"
-  echo " ------------------------------------------------------------------------ "
-  echo " IMPORTANT: Copy the Certificate below (including BEGIN and END lines)    "
-  echo " You MUST paste this during the Client installation!                      "
-  echo -e "\n$(cat /etc/g-tun/cert.pem)\n"
-  echo " You can manage the tunnel anytime by typing: g-tun"
-  echo "=========================================================================="
+ TOKEN: ${token}
+
+ --------------------------------------------------------------------------
+ Paste this certificate (including the BEGIN and END lines) into the client
+ installer. The client trusts only this exact certificate.
+
+$(cat "${CONF_DIR}/cert.pem")
+
+ Manage the tunnel at any time by typing: g-tun
+==========================================================================
+DONE
 }
 
 setup_client() {
-  local control_port="$1"
-  local server_ip data_port local_port existing_token secret_token
+  local server_ip control_port local_port token existing
 
-  read -r -p "Enter Server IP Address: " server_ip
-  if [[ -z "${server_ip}" ]]; then
-    echo "Error: Server IP cannot be empty." >&2
-    exit 1
-  fi
-  
-  read -r -p "Enter Server Data Port (default 8081): " data_port
-  data_port="${data_port:-8081}"
-  
-  read -r -p "Enter Local Port to Listen on (default 1080): " local_port
-  local_port="${local_port:-1080}"
+  prompt server_ip "Enter Server IP Address" "" valid_host
+  prompt control_port "Enter the server's Control Port" 8080 valid_port
+  prompt local_port "Enter Local Port to Listen on" 1080 valid_port
 
-  existing_token=""
-  if [[ -f /etc/g-tun/client_config.json ]]; then
-    existing_token=$(grep '"token"' /etc/g-tun/client_config.json | cut -d '"' -f 4 || true)
-  fi
-
+  existing="$(json_value "${CONF_DIR}/client_config.json" token)"
   echo "------------------------------------------"
-  if [[ -n "${existing_token}" ]]; then
-    read -r -p "Paste the 64-character Token from Server (Press Enter to keep existing): " secret_token
-    secret_token="${secret_token:-$existing_token}"
+  if [[ -n ${existing} ]]; then
+    read -r -p "Paste the Token from the server (Enter keeps the existing one): " token
+    token=${token:-${existing}}
   else
-    read -r -p "Paste the 64-character Token from Server: " secret_token
+    read -r -p "Paste the Token from the server: " token
   fi
+  [[ ${#token} -ge 16 ]] || die "the token must be at least 16 characters."
 
-  if [[ ! -s /etc/g-tun/cert.pem ]]; then
+  mkdir -p "${CONF_DIR}"
+  chmod 700 "${CONF_DIR}"
+
+  if [[ ! -s ${CONF_DIR}/cert.pem ]]; then
     echo "------------------------------------------"
-    echo "MITM Protection requires the Server's Certificate (cert.pem)."
-    echo "Press ENTER to open the editor. Paste the certificate you copied from the server,"
-    echo "then press Ctrl+O, Enter, and Ctrl+X to save and exit."
-    read -r -p "Press ENTER to continue..."
-    nano /etc/g-tun/cert.pem
-  else
-    echo "------------------------------------------"
-    echo "Found existing cert.pem in /etc/g-tun/. Skipping certificate prompt."
+    echo "The server's certificate is needed to protect against man-in-the-middle attacks."
+    echo "The editor opens next: paste the certificate printed by the server installer,"
+    echo "then press Ctrl+O, Enter, Ctrl+X to save and exit."
+    read -r -p "Press ENTER to continue..." _
+    nano "${CONF_DIR}/cert.pem"
   fi
+  openssl x509 -in "${CONF_DIR}/cert.pem" -noout 2> /dev/null \
+    || die "${CONF_DIR}/cert.pem is not a valid certificate."
 
-  cat <<EOF > /etc/g-tun/client_config.json
+  (
+    umask 077
+    cat > "${CONF_DIR}/client_config.json" <<JSON
 {
     "control_server_address": "${server_ip}:${control_port}",
     "remote_server_ip": "${server_ip}",
-    "data_port": "${data_port}",
     "local_listen_port": "0.0.0.0:${local_port}",
-    "token": "${secret_token}",
-    "kcp_config": {
-        "NoDelay": 1, "Interval": 20, "Resend": 2, "NoCongestion": 1,
-        "SndWnd": 4096, "RcvWnd": 4096, "DataShards": 10, "ParityShards": 3
-    }
+    "token": "${token}"
 }
-EOF
+JSON
+  )
 
-  echo "Building Client Binary..."
-  cd "${WORK_DIR}/client"
-  "${GO_BIN}" get github.com/quic-go/quic-go@v0.48.2
-  "${GO_BIN}" mod tidy
-  "${GO_BIN}" build -o g-tun-client client.go
-  mv g-tun-client /usr/local/bin/
+  build_binary g-tun-client
+  "${BIN_DIR}/g-tun-client" -config "${CONF_DIR}/client_config.json" -check
+  write_service client
+  systemctl enable g-tun-client
+  systemctl restart g-tun-client
+  install_panel
 
-  cat <<EOF > /etc/systemd/system/g-tun-client.service
-[Unit]
-Description=G-Tun Client Service
-After=network.target
+  cat <<DONE
+==========================================================================
+ Client setup complete and running in the background.
+ Applications can now connect to port ${local_port} on this machine.
+ Manage the tunnel at any time by typing: g-tun
+==========================================================================
+DONE
+}
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/etc/g-tun
-ExecStart=/usr/local/bin/g-tun-client
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-Environment="GOGC=400"
-Environment="GOMEMLIMIT=768MiB"
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now g-tun-client
-  
-  cp "${WORK_DIR}/g-tun.sh" /usr/bin/g-tun
-  chmod +x /usr/bin/g-tun
-  
-  echo "=========================================================================="
-  echo " Client setup complete and running in background!"
-  echo " You can manage the tunnel anytime by typing: g-tun"
-  echo "=========================================================================="
+update_installed() {
+  local role
+  if [[ -f ${UNIT_DIR}/g-tun-server.service ]]; then
+    role=server
+  elif [[ -f ${UNIT_DIR}/g-tun-client.service ]]; then
+    role=client
+  else
+    die "G-Tun is not installed; run the installer without --update."
+  fi
+  install_go
+  fetch_source
+  build_binary "g-tun-${role}"
+  "${BIN_DIR}/g-tun-${role}" -config "${CONF_DIR}/${role}_config.json" -check
+  write_service "${role}"
+  systemctl restart "g-tun-${role}"
+  install_panel
+  info "Updated and restarted g-tun-${role}. Remember to update the other side too."
 }
 
 main() {
+  require_root
   echo "=========================================="
   echo "          G-Tun Setup Wizard              "
   echo "=========================================="
 
-  check_root
+  if [[ ${1:-} == --update ]]; then
+    update_installed
+    return
+  fi
+
   install_dependencies
   tune_system
   install_go
@@ -284,23 +369,13 @@ main() {
   echo "Select setup type:"
   echo "1) Server"
   echo "2) Client"
-  
-  local setup_type control_port
+  local setup_type
   read -r -p "Enter choice [1 or 2]: " setup_type
-
-  read -r -p "Enter Control Port (default 8080): " control_port
-  control_port="${control_port:-8080}"
-
-  mkdir -p /etc/g-tun
-
-  if [[ "${setup_type}" == "1" ]]; then
-    setup_server "${control_port}"
-  elif [[ "${setup_type}" == "2" ]]; then
-    setup_client "${control_port}"
-  else
-    echo "Invalid choice. Exiting." >&2
-    exit 1
-  fi
+  case ${setup_type} in
+    1) setup_server ;;
+    2) setup_client ;;
+    *) die "invalid choice." ;;
+  esac
 }
 
 main "$@"
