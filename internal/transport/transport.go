@@ -9,6 +9,9 @@ package transport
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -46,6 +49,9 @@ type ServerOptions struct {
 	CertPath string
 	KeyPath  string
 	KCP      config.KCP
+	// StealthHandshake is the host:port of the real web site that
+	// unauthenticated stealth connections are forwarded to.
+	StealthHandshake string
 }
 
 // ClientOptions configures a Client.
@@ -59,6 +65,11 @@ type ClientOptions struct {
 	// CertPath is the pinned server certificate, required for protocols that use TLS.
 	CertPath string
 	KCP      config.KCP
+	// StealthSNI is the server name presented in the stealth TLS handshake.
+	StealthSNI string
+	// StealthRootCAs verifies the handshake site's certificate. Nil means the
+	// system roots.
+	StealthRootCAs *x509.CertPool
 }
 
 // Server accepts tunnel connections and relays them to the target.
@@ -78,6 +89,11 @@ func NewServer(o ServerOptions) (Server, error) {
 	if _, err := proto.Parse(string(o.Protocol)); err != nil {
 		return nil, err
 	}
+	if o.Protocol == proto.Stealth {
+		if _, _, err := net.SplitHostPort(o.StealthHandshake); err != nil {
+			return nil, fmt.Errorf("stealth handshake server must be host:port: %w", err)
+		}
+	}
 	s := &server{opts: o, log: slog.With("protocol", string(o.Protocol))}
 	if o.Protocol.TLS() {
 		var err error
@@ -92,6 +108,9 @@ func NewServer(o ServerOptions) (Server, error) {
 func NewClient(o ClientOptions) (Client, error) {
 	if _, err := proto.Parse(string(o.Protocol)); err != nil {
 		return nil, err
+	}
+	if o.Protocol == proto.Stealth && o.StealthSNI == "" {
+		return nil, errors.New("stealth requires a server name (SNI)")
 	}
 	c := &client{opts: o, log: slog.With("protocol", string(o.Protocol))}
 	if o.Protocol.TLS() {

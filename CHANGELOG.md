@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.0
+
+### Added
+- **Protocol 10, `stealth`**, for heavily filtered networks: ShadowTLS v3 (real TLS 1.3 handshake with a real web
+  site, relayed by the server) with a Chrome-like ClientHello (uTLS), carrying a multiplexed session. Connections
+  without the token are forwarded to the real site, so active probing sees only that site.
+- Stealth runs **without a control port**: new client options `protocol`, `data_port`, `stealth_sni` and
+  `stealth_ca_file` configure a fixed transport, and the server option `stealth_handshake_server` names the
+  handshake site. The installer offers it as option 10 (the default) and checks that the site supports TLS 1.3.
+- New dependencies: `sagernet/sing-shadowtls`, `sagernet/sing` (pinned to v0.6.3, the last release that builds with
+  Go 1.23) and `metacubex/utls`.
+
 ## 2.0.0
 
 A full rewrite of the code base. **The wire protocol changed: update the server and every client together.**

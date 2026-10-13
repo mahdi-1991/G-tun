@@ -74,6 +74,16 @@ func TestLoadServer(t *testing.T) {
 			wantErr: "tls_cert_path",
 		},
 		{
+			name: "stealth needs no control port or certificate",
+			body: `{"data_port":"443","protocol":"stealth","stealth_handshake_server":"www.example.com:443",
+				"xray_inbound_address":"127.0.0.1:10085","token":"` + token + `"}`,
+		},
+		{
+			name:    "stealth needs a handshake site",
+			body:    `{"data_port":"443","protocol":"stealth","xray_inbound_address":"127.0.0.1:10085","token":"` + token + `"}`,
+			wantErr: "stealth_handshake_server",
+		},
+		{
 			name:    "invalid json",
 			body:    `{`,
 			wantErr: "parse config",
@@ -123,10 +133,21 @@ func TestLoadClient(t *testing.T) {
 		t.Errorf("TLSCertPath = %q, want %q", cfg.TLSCertPath, want)
 	}
 
+	static, err := LoadClient(writeConfig(t, `{"protocol":"stealth","data_port":"443","stealth_sni":"www.example.com",
+		"remote_server_ip":"203.0.113.5","local_listen_port":"0.0.0.0:1080","token":"`+token+`"}`))
+	if err != nil {
+		t.Fatalf("LoadClient (static stealth, no control address): %v", err)
+	}
+	if static.Protocol != proto.Stealth {
+		t.Errorf("Protocol = %q", static.Protocol)
+	}
+
 	for name, body := range map[string]string{
-		"no control address": `{"remote_server_ip":"1.2.3.4","local_listen_port":":1080","token":"` + token + `"}`,
-		"no remote host":     `{"control_server_address":"1.2.3.4:8080","local_listen_port":":1080","token":"` + token + `"}`,
-		"bad listen address": `{"control_server_address":"1.2.3.4:8080","remote_server_ip":"1.2.3.4","local_listen_port":"1080","token":"` + token + `"}`,
+		"stealth without sni": `{"protocol":"stealth","data_port":"443","remote_server_ip":"1.2.3.4","local_listen_port":":1080","token":"` + token + `"}`,
+		"static bad port":     `{"protocol":"tcp","data_port":"0","remote_server_ip":"1.2.3.4","local_listen_port":":1080","token":"` + token + `"}`,
+		"no control address":  `{"remote_server_ip":"1.2.3.4","local_listen_port":":1080","token":"` + token + `"}`,
+		"no remote host":      `{"control_server_address":"1.2.3.4:8080","local_listen_port":":1080","token":"` + token + `"}`,
+		"bad listen address":  `{"control_server_address":"1.2.3.4:8080","remote_server_ip":"1.2.3.4","local_listen_port":"1080","token":"` + token + `"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := LoadClient(writeConfig(t, body)); err == nil {

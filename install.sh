@@ -180,17 +180,26 @@ install_panel() {
 
 # ---------------------------------------------------------------- roles
 
-setup_server() {
-  local control_port data_port protocol target token choice
+# check_tls13 HOST:PORT verifies that a web site completes a TLS 1.3 handshake,
+# which the stealth protocol requires of its handshake site.
+check_tls13() {
+  local host="${1%:*}"
+  timeout 15 openssl s_client -tls1_3 -connect "$1" -servername "${host}" < /dev/null 2> /dev/null \
+    | grep -q "TLSv1.3"
+}
 
-  prompt control_port "Enter Control Port" 8080 valid_port
+setup_server() {
+  local control_port="" data_port protocol target token choice handshake_site="" default_port=8081
+
   echo "------------------------------------------"
   echo "Select Protocol:"
   echo "1) tcp    2) udp      3) ws       4) tcpmux"
   echo "5) wsmux  6) wss      7) wssmux   8) utcpmux (KCP)"
-  echo "9) quic   (best against censorship)"
-  read -r -p "Enter choice [1-9] (default 9): " choice
-  case ${choice:-9} in
+  echo "9) quic"
+  echo "10) stealth  - ShadowTLS v3 + multiplexing. Real TLS handshake with a real site;"
+  echo "               the best choice under heavy filtering and active probing."
+  read -r -p "Enter choice [1-10] (default 10): " choice
+  case ${choice:-10} in
     1) protocol=tcp ;;
     2) protocol=udp ;;
     3) protocol=ws ;;
@@ -199,11 +208,30 @@ setup_server() {
     6) protocol=wss ;;
     7) protocol=wssmux ;;
     8) protocol=utcpmux ;;
-    *) protocol=quic ;;
+    9) protocol=quic ;;
+    10) protocol=stealth ;;
+    *) die "invalid choice." ;;
   esac
 
+  if [[ ${protocol} == stealth ]]; then
+    default_port=443
+    echo "------------------------------------------"
+    echo "Stealth forwards unauthenticated visitors to a real web site, so the site must"
+    echo "support TLS 1.3, be reachable from THIS server, and be reachable (not filtered)"
+    echo "from where your clients are. Popular, large sites work best."
+    while true; do
+      prompt handshake_site "Handshake site host:port" www.microsoft.com:443 valid_hostport
+      if check_tls13 "${handshake_site}"; then
+        break
+      fi
+      echo "${handshake_site} did not complete a TLS 1.3 handshake from this server; pick another."
+    done
+  else
+    prompt control_port "Enter Control Port" 8080 valid_port
+  fi
+
   prompt target "Enter Xray/Destination Address" 127.0.0.1:10085 valid_hostport
-  prompt data_port "Enter Data Port for Tunnel" 8081 valid_port
+  prompt data_port "Enter Data Port for Tunnel" "${default_port}" valid_port
 
   token="$(json_value "${CONF_DIR}/server_config.json" token)"
   if [[ -z ${token} ]]; then
@@ -214,31 +242,34 @@ setup_server() {
   mkdir -p "${CONF_DIR}"
   chmod 700 "${CONF_DIR}"
 
-  if [[ ! -s ${CONF_DIR}/cert.pem || ! -s ${CONF_DIR}/key.pem ]]; then
-    info "Generating a TLS certificate"
-    (cd "${WORK_DIR}" && GOFLAGS=-mod=mod go run ./cmd/g-tun-gencert -cert "${CONF_DIR}/cert.pem" -key "${CONF_DIR}/key.pem")
-  else
-    info "Keeping the existing certificate so clients stay connected"
+  if [[ ${protocol} != stealth ]]; then
+    if [[ ! -s ${CONF_DIR}/cert.pem || ! -s ${CONF_DIR}/key.pem ]]; then
+      info "Generating a TLS certificate"
+      (cd "${WORK_DIR}" && GOFLAGS=-mod=mod go run ./cmd/g-tun-gencert -cert "${CONF_DIR}/cert.pem" -key "${CONF_DIR}/key.pem")
+    else
+      info "Keeping the existing certificate so clients stay connected"
+    fi
+    chmod 600 "${CONF_DIR}/key.pem"
   fi
-  chmod 600 "${CONF_DIR}/key.pem"
 
   (
     umask 077
-    cat > "${CONF_DIR}/server_config.json" <<JSON
-{
-    "control_port": "${control_port}",
-    "data_port": "${data_port}",
-    "protocol": "${protocol}",
-    "xray_inbound_address": "${target}",
-    "token": "${token}",
-    "tls_cert_path": "${CONF_DIR}/cert.pem",
-    "tls_key_path": "${CONF_DIR}/key.pem",
-    "kcp_config": {
-        "NoDelay": 1, "Interval": 20, "Resend": 2, "NoCongestion": 1,
-        "SndWnd": 4096, "RcvWnd": 4096, "DataShards": 10, "ParityShards": 3
-    }
-}
-JSON
+    {
+      echo "{"
+      [[ -n ${control_port} ]] && echo "    \"control_port\": \"${control_port}\","
+      echo "    \"data_port\": \"${data_port}\","
+      echo "    \"protocol\": \"${protocol}\","
+      echo "    \"xray_inbound_address\": \"${target}\","
+      echo "    \"token\": \"${token}\","
+      [[ -n ${handshake_site} ]] && echo "    \"stealth_handshake_server\": \"${handshake_site}\","
+      echo "    \"tls_cert_path\": \"${CONF_DIR}/cert.pem\","
+      echo "    \"tls_key_path\": \"${CONF_DIR}/key.pem\","
+      echo "    \"kcp_config\": {"
+      echo "        \"NoDelay\": 1, \"Interval\": 20, \"Resend\": 2, \"NoCongestion\": 1,"
+      echo "        \"SndWnd\": 4096, \"RcvWnd\": 4096, \"DataShards\": 10, \"ParityShards\": 3"
+      echo "    }"
+      echo "}"
+    } > "${CONF_DIR}/server_config.json"
   )
 
   build_binary g-tun-server
@@ -247,6 +278,27 @@ JSON
   systemctl enable g-tun-server
   systemctl restart g-tun-server
   install_panel
+
+  if [[ ${protocol} == stealth ]]; then
+    cat <<DONE
+
+==========================================================================
+                     SERVER INSTALLATION SUCCESSFUL
+==========================================================================
+ Protocol: stealth (ShadowTLS v3)
+ Open this port in your firewall: ${data_port}/tcp   (there is no control port)
+
+ Enter these values during client installation:
+
+ TOKEN:          ${token}
+ DATA PORT:      ${data_port}
+ HANDSHAKE SNI:  ${handshake_site%:*}
+
+ No certificate is needed. Manage the tunnel at any time by typing: g-tun
+==========================================================================
+DONE
+    return
+  fi
 
   cat <<DONE
 
@@ -272,10 +324,18 @@ DONE
 }
 
 setup_client() {
-  local server_ip control_port local_port token existing
+  local server_ip control_port local_port token existing stealth="" data_port="" sni=""
 
   prompt server_ip "Enter Server IP Address" "" valid_host
-  prompt control_port "Enter the server's Control Port" 8080 valid_port
+  read -r -p "Does the server use the stealth protocol (option 10)? [Y/n]: " stealth
+  if [[ ${stealth:-y} == [yY]* ]]; then
+    stealth=yes
+    prompt data_port "Enter the server's Data Port" 443 valid_port
+    prompt sni "Enter the HANDSHAKE SNI printed by the server" "" valid_host
+  else
+    stealth=""
+    prompt control_port "Enter the server's Control Port" 8080 valid_port
+  fi
   prompt local_port "Enter Local Port to Listen on" 1080 valid_port
 
   existing="$(json_value "${CONF_DIR}/client_config.json" token)"
@@ -291,7 +351,9 @@ setup_client() {
   mkdir -p "${CONF_DIR}"
   chmod 700 "${CONF_DIR}"
 
-  if [[ ! -s ${CONF_DIR}/cert.pem ]]; then
+  if [[ -n ${stealth} ]]; then
+    : # Stealth needs no certificate: it verifies the handshake site's real one.
+  elif [[ ! -s ${CONF_DIR}/cert.pem ]]; then
     echo "------------------------------------------"
     echo "The server's certificate is needed to protect against man-in-the-middle attacks."
     echo "The editor opens next: paste the certificate printed by the server installer,"
@@ -299,12 +361,26 @@ setup_client() {
     read -r -p "Press ENTER to continue..." _
     nano "${CONF_DIR}/cert.pem"
   fi
-  openssl x509 -in "${CONF_DIR}/cert.pem" -noout 2> /dev/null \
-    || die "${CONF_DIR}/cert.pem is not a valid certificate."
+  if [[ -z ${stealth} ]]; then
+    openssl x509 -in "${CONF_DIR}/cert.pem" -noout 2> /dev/null \
+      || die "${CONF_DIR}/cert.pem is not a valid certificate."
+  fi
 
   (
     umask 077
-    cat > "${CONF_DIR}/client_config.json" <<JSON
+    if [[ -n ${stealth} ]]; then
+      cat > "${CONF_DIR}/client_config.json" <<JSON
+{
+    "protocol": "stealth",
+    "data_port": "${data_port}",
+    "stealth_sni": "${sni}",
+    "remote_server_ip": "${server_ip}",
+    "local_listen_port": "0.0.0.0:${local_port}",
+    "token": "${token}"
+}
+JSON
+    else
+      cat > "${CONF_DIR}/client_config.json" <<JSON
 {
     "control_server_address": "${server_ip}:${control_port}",
     "remote_server_ip": "${server_ip}",
@@ -312,6 +388,7 @@ setup_client() {
     "token": "${token}"
 }
 JSON
+    fi
   )
 
   build_binary g-tun-client

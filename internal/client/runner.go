@@ -2,8 +2,11 @@ package client
 
 import (
 	"context"
+	"crypto/x509"
+	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 
 	"github.com/mahdi-1991/G-tun/internal/config"
@@ -53,9 +56,18 @@ func (r *runner) apply(settings control.Config) error {
 		Token:      r.cfg.Token,
 		CertPath:   r.cfg.TLSCertPath,
 		KCP:        config.DefaultKCP(),
+
+		StealthSNI: r.cfg.StealthSNI,
 	}
 	if settings.KCP != nil {
 		opts.KCP = *settings.KCP
+	}
+	if r.cfg.StealthCAFile != "" {
+		pool, err := loadCertPool(r.cfg.StealthCAFile)
+		if err != nil {
+			return err
+		}
+		opts.StealthRootCAs = pool
 	}
 	tr, err := transport.NewClient(opts)
 	if err != nil {
@@ -101,4 +113,16 @@ func supervise(ctx context.Context, tr transport.Client) {
 		}
 		backoff = min(2*backoff, maxBackoff)
 	}
+}
+
+func loadCertPool(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read stealth_ca_file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("stealth_ca_file %s contains no certificates", path)
+	}
+	return pool, nil
 }

@@ -103,6 +103,9 @@ func (c *client) dialCarrier(ctx context.Context) (deadlineConn, error) {
 		}
 		return newWSConn(ws), nil
 
+	case c.opts.Protocol == proto.Stealth:
+		return c.dialStealth(ctx, dialer)
+
 	case c.opts.Protocol == proto.UTCPMux:
 		block, err := kcpBlockCrypt(c.opts.Token)
 		if err != nil {

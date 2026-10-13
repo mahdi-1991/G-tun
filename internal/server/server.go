@@ -35,6 +35,8 @@ func Run(ctx context.Context, cfg *config.Server) error {
 		CertPath:   cfg.TLSCertPath,
 		KeyPath:    cfg.TLSKeyPath,
 		KCP:        *cfg.KCP,
+
+		StealthHandshake: cfg.StealthHandshakeServer,
 	})
 	if err != nil {
 		return err
@@ -48,13 +50,22 @@ func Run(ctx context.Context, cfg *config.Server) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// The stealth protocol has no control port: a second, unusual connection
+	// would only give a firewall something to fingerprint.
+	listeners := 1
 	errs := make(chan error, 2)
 	go func() { errs <- data.Serve(ctx) }()
-	go func() { errs <- serveControl(ctx, cfg) }()
+	if cfg.Protocol != proto.Stealth {
+		listeners++
+		go func() { errs <- serveControl(ctx, cfg) }()
+	}
 
 	first := <-errs
 	cancel()
-	return errors.Join(first, <-errs)
+	for range listeners - 1 {
+		first = errors.Join(first, <-errs)
+	}
+	return first
 }
 
 func serveControl(ctx context.Context, cfg *config.Server) error {

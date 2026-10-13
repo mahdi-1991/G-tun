@@ -17,9 +17,12 @@ const (
 	WSSMux  Name = "wssmux"
 	UTCPMux Name = "utcpmux"
 	QUIC    Name = "quic"
+	// Stealth is ShadowTLS v3 with smux: a real TLS handshake with a real web
+	// site, then authenticated, multiplexed traffic. Built for heavy filtering.
+	Stealth Name = "stealth"
 )
 
-var supported = []Name{TCP, UDP, WS, WSS, TCPMux, WSMux, WSSMux, UTCPMux, QUIC}
+var supported = []Name{TCP, UDP, WS, WSS, TCPMux, WSMux, WSSMux, UTCPMux, QUIC, Stealth}
 
 // Parse returns s as a Name, or an error if s is not a supported protocol.
 func Parse(s string) (Name, error) {
@@ -34,7 +37,7 @@ func Parse(s string) (Name, error) {
 // Mux reports whether the protocol multiplexes streams with smux.
 func (n Name) Mux() bool {
 	switch n {
-	case TCPMux, WSMux, WSSMux, UTCPMux:
+	case TCPMux, WSMux, WSSMux, UTCPMux, Stealth:
 		return true
 	}
 	return false

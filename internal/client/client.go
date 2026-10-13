@@ -32,6 +32,10 @@ func Run(ctx context.Context, cfg *config.Client) error {
 	r := newRunner(ctx, cfg)
 	defer r.stop()
 
+	if cfg.Protocol != "" {
+		return runStatic(ctx, cfg, r)
+	}
+
 	backoff := minBackoff
 	for {
 		established, err := runControl(ctx, cfg, r)
@@ -47,6 +51,17 @@ func Run(ctx context.Context, cfg *config.Client) error {
 		}
 		backoff = min(2*backoff, maxBackoff)
 	}
+}
+
+// runStatic runs the transport named in the configuration and never contacts
+// a control port. The transport restarts itself with backoff if it fails.
+func runStatic(ctx context.Context, cfg *config.Client, r *runner) error {
+	slog.Info("static mode: no control connection", "protocol", string(cfg.Protocol), "port", cfg.DataPort)
+	if err := r.apply(control.Config{Protocol: cfg.Protocol, Port: cfg.DataPort}); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return nil
 }
 
 // runControl holds one control connection. It reports whether the server

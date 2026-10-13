@@ -63,6 +63,9 @@ type Server struct {
 	Token         string     `json:"token"`
 	TLSCertPath   string     `json:"tls_cert_path"`
 	TLSKeyPath    string     `json:"tls_key_path"`
+	// StealthHandshakeServer is the real web site (host:port) that stealth
+	// connections without valid credentials are forwarded to.
+	StealthHandshakeServer string `json:"stealth_handshake_server"`
 	// KCP is never nil after LoadServer returns. The server pushes it to
 	// clients, so both ends always agree on the parameters.
 	KCP *KCP `json:"kcp_config"`
@@ -70,10 +73,22 @@ type Server struct {
 
 // Client is the configuration of g-tun-client.
 type Client struct {
+	// ControlAddress is the server's control port. It is unused when Protocol
+	// is set.
 	ControlAddress string `json:"control_server_address"`
 	RemoteHost     string `json:"remote_server_ip"`
 	ListenAddress  string `json:"local_listen_port"`
 	Token          string `json:"token"`
+	// Protocol and DataPort select a fixed transport. When Protocol is set the
+	// client never contacts a control port, so there is no extra connection
+	// for a firewall to fingerprint. The stealth protocol always runs this way.
+	Protocol proto.Name `json:"protocol"`
+	DataPort string     `json:"data_port"`
+	// StealthSNI is the host name of the server's handshake web site.
+	StealthSNI string `json:"stealth_sni"`
+	// StealthCAFile optionally replaces the system root certificates used to
+	// verify the handshake site (a PEM bundle).
+	StealthCAFile string `json:"stealth_ca_file"`
 	// TLSCertPath is the pinned server certificate. It defaults to cert.pem
 	// next to the configuration file.
 	TLSCertPath string `json:"tls_cert_path"`
@@ -114,10 +129,15 @@ func (c *Server) validate() error {
 	if _, err := proto.Parse(string(c.Protocol)); err != nil {
 		return err
 	}
-	if err := validatePort("control_port", c.ControlPort); err != nil {
+	if err := validatePort("data_port", c.DataPort); err != nil {
 		return err
 	}
-	if err := validatePort("data_port", c.DataPort); err != nil {
+	if c.Protocol == proto.Stealth {
+		// Stealth runs without a control port; clients are configured statically.
+		if err := validateHostPort("stealth_handshake_server", c.StealthHandshakeServer); err != nil {
+			return err
+		}
+	} else if err := validatePort("control_port", c.ControlPort); err != nil {
 		return err
 	}
 	if c.ControlPort == c.DataPort && !c.Protocol.UDPBased() {
@@ -136,7 +156,17 @@ func (c *Server) validate() error {
 }
 
 func (c *Client) validate() error {
-	if err := validateHostPort("control_server_address", c.ControlAddress); err != nil {
+	if c.Protocol != "" {
+		if _, err := proto.Parse(string(c.Protocol)); err != nil {
+			return err
+		}
+		if err := validatePort("data_port", c.DataPort); err != nil {
+			return err
+		}
+		if c.Protocol == proto.Stealth && c.StealthSNI == "" {
+			return fmt.Errorf("stealth_sni is required for protocol %q", c.Protocol)
+		}
+	} else if err := validateHostPort("control_server_address", c.ControlAddress); err != nil {
 		return err
 	}
 	if c.RemoteHost == "" {

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -24,6 +26,7 @@ const token = "0123456789abcdef0123456789abcdef"
 var (
 	streamProtocols = []proto.Name{
 		proto.TCP, proto.TCPMux, proto.WS, proto.WSMux, proto.WSS, proto.WSSMux, proto.UTCPMux, proto.QUIC,
+		proto.Stealth,
 	}
 	// Protocols whose streams support half-close end to end. WebSocket has
 	// no equivalent and smux half-close can lose data, so those protocols
@@ -103,7 +106,55 @@ func echoUDP(t *testing.T) (addr string, received *atomic.Int64) {
 	return pc.LocalAddr().String(), received
 }
 
+// fakeSite stands in for the real web site that stealth connections are
+// relayed to: a TLS 1.3 server that completes handshakes and ignores the rest.
+type fakeSite struct {
+	addr string
+	cert []byte // DER of its certificate
+	pool *x509.CertPool
+}
+
+func startFakeSite(t *testing.T) *fakeSite {
+	t.Helper()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := tlsutil.GenerateSelfSigned(certPath, keyPath); err != nil {
+		t.Fatal(err)
+	}
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{pair},
+		MinVersion:   tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); _, _ = io.Copy(io.Discard, c) }()
+		}
+	}()
+	return &fakeSite{addr: ln.Addr().String(), cert: pair.Certificate[0], pool: pool}
+}
+
 type harness struct {
+	site      *fakeSite // only for the stealth protocol
+	dataAddr  string
 	localAddr string
 	target    *atomic.Int64 // connections (or datagrams) that reached the target
 }
@@ -145,7 +196,11 @@ func startTunnelTo(t *testing.T, p proto.Name, clientToken, target string) harne
 		}
 	}
 
-	srv, err := transport.NewServer(transport.ServerOptions{
+	var site *fakeSite
+	if p == proto.Stealth {
+		site = startFakeSite(t)
+	}
+	srvOpts := transport.ServerOptions{
 		Protocol:   p,
 		ListenAddr: "127.0.0.1:" + dataPort,
 		Target:     target,
@@ -153,18 +208,25 @@ func startTunnelTo(t *testing.T, p proto.Name, clientToken, target string) harne
 		CertPath:   certPath,
 		KeyPath:    keyPath,
 		KCP:        config.DefaultKCP(),
-	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
 	}
-	cli, err := transport.NewClient(transport.ClientOptions{
+	cliOpts := transport.ClientOptions{
 		Protocol:   p,
 		ServerAddr: "127.0.0.1:" + dataPort,
 		ListenAddr: "127.0.0.1:" + localPort,
 		Token:      clientToken,
 		CertPath:   certPath,
 		KCP:        config.DefaultKCP(),
-	})
+	}
+	if site != nil {
+		srvOpts.StealthHandshake = site.addr
+		cliOpts.StealthSNI = "localhost"
+		cliOpts.StealthRootCAs = site.pool
+	}
+	srv, err := transport.NewServer(srvOpts)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	cli, err := transport.NewClient(cliOpts)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -186,7 +248,7 @@ func startTunnelTo(t *testing.T, p proto.Name, clientToken, target string) harne
 			}
 		}
 	})
-	return harness{localAddr: "127.0.0.1:" + localPort}
+	return harness{site: site, dataAddr: "127.0.0.1:" + dataPort, localAddr: "127.0.0.1:" + localPort}
 }
 
 // eventually retries fn until it succeeds or the timeout expires.
@@ -336,6 +398,31 @@ func TestTargetReplyThenClose(t *testing.T) {
 				return nil
 			})
 		})
+	}
+}
+
+// Anyone who connects to a stealth server without the token, such as a
+// firewall's active prober, must see the real web site and nothing else.
+func TestStealthProbeSeesRealSite(t *testing.T) {
+	h := startTunnel(t, proto.Stealth, token)
+	// Make sure the server is up first.
+	eventually(t, 15*time.Second, func() error {
+		return echoRoundTrip(h.localAddr, []byte("ping"), false)
+	})
+
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", h.dataAddr, &tls.Config{
+		ServerName:         "localhost",
+		InsecureSkipVerify: true, // The test compares the certificate itself below.
+		MinVersion:         tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("a plain TLS client could not complete a handshake: %v", err)
+	}
+	defer conn.Close()
+
+	got := conn.ConnectionState().PeerCertificates[0].Raw
+	if !bytes.Equal(got, h.site.cert) {
+		t.Error("the prober received a certificate other than the real site's")
 	}
 }
 

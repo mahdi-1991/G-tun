@@ -36,6 +36,8 @@ func (s *server) Serve(ctx context.Context) error {
 		return s.serveQUIC(ctx)
 	case proto.UDP:
 		return s.serveUDP(ctx)
+	case proto.Stealth:
+		return s.serveStealth(ctx)
 	}
 	return fmt.Errorf("transport: unsupported protocol %q", s.opts.Protocol)
 }

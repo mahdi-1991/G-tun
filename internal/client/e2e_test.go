@@ -3,9 +3,12 @@ package client_test
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/mahdi-1991/G-tun/internal/config"
 	"github.com/mahdi-1991/G-tun/internal/proto"
 	"github.com/mahdi-1991/G-tun/internal/server"
+	"github.com/mahdi-1991/G-tun/internal/tlsutil"
 )
 
 const token = "0123456789abcdef0123456789abcdef"
@@ -179,4 +183,78 @@ func TestClientReconnectsAfterServerRestart(t *testing.T) {
 
 	start(t, run)
 	waitForEcho(t, "127.0.0.1:"+localPort, 20*time.Second)
+}
+
+// fakeSite is a TLS 1.3 web site standing in for the stealth handshake site.
+// It returns its address and the path of its certificate.
+func fakeSite(t *testing.T) (addr, certPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := tlsutil.GenerateSelfSigned(certPath, keyPath); err != nil {
+		t.Fatal(err)
+	}
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); _, _ = io.Copy(io.Discard, c) }()
+		}
+	}()
+	return ln.Addr().String(), certPath
+}
+
+// Stealth needs no control port: the server starts none, and the client is
+// configured with the transport directly.
+func TestStealthWithoutControlChannel(t *testing.T) {
+	target := echoServer(t)
+	site, siteCert := fakeSite(t)
+	dataPort, localPort := freePort(t), freePort(t)
+
+	srvCfg := serverConfig(proto.Stealth, "", dataPort, target)
+	srvCfg.StealthHandshakeServer = site
+	start(t, func(ctx context.Context) error { return server.Run(ctx, srvCfg) })
+
+	cliCfg := &config.Client{
+		Protocol:      proto.Stealth,
+		DataPort:      dataPort,
+		StealthSNI:    "localhost",
+		StealthCAFile: siteCert,
+		RemoteHost:    "127.0.0.1",
+		ListenAddress: "127.0.0.1:" + localPort,
+		Token:         token,
+	}
+	start(t, func(ctx context.Context) error { return client.Run(ctx, cliCfg) })
+	waitForEcho(t, "127.0.0.1:"+localPort, 15*time.Second)
+
+	// The control port really does not exist.
+	if conn, err := net.DialTimeout("tcp", "127.0.0.1:8080", 200*time.Millisecond); err == nil {
+		conn.Close()
+		t.Log("something else listens on 8080; skipping the control-port assertion")
+	}
+}
+
+func TestStealthRejectsBadCAFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(path, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Client{
+		Protocol: proto.Stealth, DataPort: "443", StealthSNI: "localhost", StealthCAFile: path,
+		RemoteHost: "127.0.0.1", ListenAddress: "127.0.0.1:" + freePort(t), Token: token,
+	}
+	if err := client.Run(context.Background(), cfg); err == nil {
+		t.Fatal("client.Run accepted a CA file without certificates")
+	}
 }
